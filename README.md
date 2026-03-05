@@ -1,6 +1,6 @@
-# Ollama Client (Local Web Chat)
+# LocalLlama
 
-A minimal web app that lets you chat with a locally hosted Ollama server at `http://localhost:11434`.
+`LocalLlama` is a minimal web app that lets you chat with a locally hosted Ollama server at `http://localhost:11434`.
 
 ## Features
 
