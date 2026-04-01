@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Local-Llama</title>
+    <title>🪴 bonsAI - local ollama client</title>
     <link rel="stylesheet" href="/styles.css" />
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
   </head>
@@ -11,9 +11,9 @@
     <main class="app">
       <header class="topbar">
         <div class="topbar-brand">
-          <h1>Local-Llama</h1>
+          <h1><span class="brand-mark" aria-hidden="true">🪴</span><span>bonsAI</span></h1>
           <small>
-            by Julien Regnault |
+            local ollama client |
             <a href="https://github.com/Philipid3s" target="_blank" rel="noreferrer noopener">
               github.com/Philipid3s
             </a>
@@ -38,55 +38,85 @@
           <section id="messages" class="messages" aria-live="polite"></section>
 
           <form id="chat-form" class="composer">
-            <div id="attached-files" class="attached-files" aria-live="polite"></div>
-            <div class="composer-row">
-              <div class="composer-tools">
-                <button
-                  id="web-search-btn"
-                  class="icon-btn tool-icon-btn"
-                  type="button"
-                  aria-label="Toggle Web Search"
-                  aria-pressed="false"
-                  title="Web Search"
-                >
-                  <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                    <path
-                      d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm0 0c2.5 2.7 3.8 6.3 3.8 10S14.5 19.3 12 22m0-20C9.5 4.7 8.2 8.3 8.2 12S9.5 19.3 12 22m-9-10h18M4.5 7h15m-15 10h15"
-                      fill="none"
-                      stroke="currentColor"
-                      stroke-width="1.8"
-                      stroke-linecap="round"
-                      stroke-linejoin="round"
-                    />
-                  </svg>
-                </button>
-                <button id="attach-btn" class="icon-btn" type="button" aria-label="Attach PDF">
-                  <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                    <path
-                      d="M8 12.5v5a4 4 0 0 0 8 0v-9a3 3 0 0 0-6 0v8a2 2 0 0 0 4 0V10"
-                      fill="none"
-                      stroke="currentColor"
-                      stroke-width="2"
-                      stroke-linecap="round"
-                      stroke-linejoin="round"
-                    />
-                  </svg>
-                </button>
+            <div class="composer-frame">
+              <div class="composer-toolbar">
+                <div class="composer-toolbar-group">
+                  <span class="composer-label">Tools</span>
+                  <div class="composer-tools">
+                    <button
+                      id="web-search-btn"
+                      class="icon-btn tool-icon-btn"
+                      type="button"
+                      aria-label="Toggle Web Search"
+                      aria-pressed="false"
+                      title="Web Search"
+                    >
+                      <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                        <path
+                          d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm0 0c2.5 2.7 3.8 6.3 3.8 10S14.5 19.3 12 22m0-20C9.5 4.7 8.2 8.3 8.2 12S9.5 19.3 12 22m-9-10h18M4.5 7h15m-15 10h15"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="1.8"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                        />
+                      </svg>
+                      <span>Web</span>
+                    </button>
+                    <button id="attach-btn" class="icon-btn attach-btn" type="button" aria-label="Attach PDF">
+                      <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                        <path
+                          d="M8 12.5v5a4 4 0 0 0 8 0v-9a3 3 0 0 0-6 0v8a2 2 0 0 0 4 0V10"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="2"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                        />
+                      </svg>
+                      <span>PDF</span>
+                    </button>
+                  </div>
+                </div>
+                <p class="composer-hint">Enter to send. Shift+Enter for a new line.</p>
               </div>
               <input id="pdf-file" name="pdf-file" type="file" accept="application/pdf,.pdf" hidden />
-              <textarea
-                id="prompt"
-                name="prompt"
-                rows="3"
-                placeholder="Type your message..."
-                required
-              ></textarea>
-              <button id="send-btn" type="submit">Send</button>
+              <div id="attached-files" class="attached-files" aria-live="polite"></div>
+              <div class="composer-row">
+                <textarea
+                  id="prompt"
+                  name="prompt"
+                  rows="3"
+                  placeholder="Ask your local model something useful..."
+                  required
+                ></textarea>
+                <div class="composer-actions">
+                  <button id="send-btn" type="submit">Send</button>
+                </div>
+              </div>
             </div>
           </form>
         </section>
       </div>
     </main>
+
+    <div id="confirm-modal" class="modal-shell hidden" aria-hidden="true">
+      <div class="modal-backdrop" data-close-modal="true"></div>
+      <section
+        class="modal-card"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="confirm-modal-title"
+        aria-describedby="confirm-modal-description"
+      >
+        <h2 id="confirm-modal-title">Delete chat?</h2>
+        <p id="confirm-modal-description"></p>
+        <div class="modal-actions">
+          <button id="confirm-cancel-btn" type="button" class="modal-btn">Cancel</button>
+          <button id="confirm-delete-btn" type="button" class="modal-btn danger">Delete</button>
+        </div>
+      </section>
+    </div>
 
     <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/15.0.0/marked.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/marked-highlight/lib/index.umd.js"></script>

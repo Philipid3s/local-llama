@@ -1,6 +1,6 @@
 @echo off
 REM ==========================================
-REM  Ollama Client - Auto Start Script
+REM  bonsAI - local ollama client - Auto Start Script
 REM  (Starts the Node server and opens the page)
 REM ==========================================
 
@@ -28,7 +28,7 @@ if defined LISTEN_PID (
   echo Reusing existing server and opening the dashboard page.
 ) else (
   REM --- Start the server in the background ---
-  start "OllamaClient" cmd /k "npm start"
+  start "bonsAI" cmd /k "npm start"
   REM --- Wait a few seconds for the server to start ---
   timeout /t 3 /nobreak >nul
 )

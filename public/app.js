@@ -9,9 +9,17 @@ const pdfFileEl = document.getElementById("pdf-file");
 const attachedFilesEl = document.getElementById("attached-files");
 const newChatBtnEl = document.getElementById("new-chat-btn");
 const threadsListEl = document.getElementById("threads-list");
+const confirmModalEl = document.getElementById("confirm-modal");
+const confirmModalDescriptionEl = document.getElementById("confirm-modal-description");
+const confirmCancelBtnEl = document.getElementById("confirm-cancel-btn");
+const confirmDeleteBtnEl = document.getElementById("confirm-delete-btn");
 
-const STORAGE_KEY = "localllama_threads_v1";
-const WEB_SEARCH_TOGGLE_KEY = "localllama_web_search_enabled";
+const STORAGE_KEY = "bonsai_threads_v1";
+const WEB_SEARCH_TOGGLE_KEY = "bonsai_web_search_enabled";
+const MODEL_SELECTION_KEY = "bonsai_selected_model";
+const LEGACY_STORAGE_KEY = "localllama_threads_v1";
+const LEGACY_WEB_SEARCH_TOGGLE_KEY = "localllama_web_search_enabled";
+const LEGACY_MODEL_SELECTION_KEY = "localllama_selected_model";
 const MAX_PDF_CONTEXT_CHARS = 12_000;
 const MAX_TOTAL_PDF_CONTEXT_CHARS = 30_000;
 const MAX_STORED_PDF_TEXT_CHARS = 120_000;
@@ -22,6 +30,8 @@ let isSending = false;
 let isPdfLoading = false;
 let storageWarningShown = false;
 let webSearchEnabled = false;
+let renamingThreadId = null;
+let pendingDeleteThreadId = null;
 
 // Global Markdown configuration
 if (typeof marked !== "undefined") {
@@ -52,15 +62,16 @@ function escapeHtml(value) {
 }
 
 function renderMarkdownToSafeHtml(markdownText) {
+  const safeMarkdown = escapeHtml(markdownText);
   if (typeof marked === "undefined") {
-    return `<p>${markdownText}</p>`;
+    return `<p>${safeMarkdown}</p>`;
   }
 
   try {
-    return marked.parse(markdownText);
+    return marked.parse(safeMarkdown);
   } catch (e) {
     console.error("Markdown parse error:", e);
-    return `<p>${markdownText}</p>`;
+    return `<p>${safeMarkdown}</p>`;
   }
 }
 
@@ -77,17 +88,54 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-function loadWebSearchPreference() {
+function readLocalStorage(key) {
   try {
-    return localStorage.getItem(WEB_SEARCH_TOGGLE_KEY) === "true";
+    return localStorage.getItem(key);
   } catch {
-    return false;
+    return null;
   }
+}
+
+function migrateLegacyStorageKey(nextKey, legacyKey) {
+  const currentValue = readLocalStorage(nextKey);
+  if (currentValue !== null) {
+    return currentValue;
+  }
+
+  const legacyValue = readLocalStorage(legacyKey);
+  if (legacyValue === null) {
+    return null;
+  }
+
+  try {
+    localStorage.setItem(nextKey, legacyValue);
+    localStorage.removeItem(legacyKey);
+  } catch {
+    return legacyValue;
+  }
+
+  return legacyValue;
+}
+
+function loadWebSearchPreference() {
+  return migrateLegacyStorageKey(WEB_SEARCH_TOGGLE_KEY, LEGACY_WEB_SEARCH_TOGGLE_KEY) === "true";
 }
 
 function saveWebSearchPreference(enabled) {
   try {
     localStorage.setItem(WEB_SEARCH_TOGGLE_KEY, enabled ? "true" : "false");
+  } catch {
+    // Ignore localStorage failures for this preference.
+  }
+}
+
+function loadSelectedModelPreference() {
+  return migrateLegacyStorageKey(MODEL_SELECTION_KEY, LEGACY_MODEL_SELECTION_KEY) || "";
+}
+
+function saveSelectedModelPreference(model) {
+  try {
+    localStorage.setItem(MODEL_SELECTION_KEY, String(model || ""));
   } catch {
     // Ignore localStorage failures for this preference.
   }
@@ -194,7 +242,7 @@ function normalizeThread(rawThread) {
 
 function loadThreadState() {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = migrateLegacyStorageKey(STORAGE_KEY, LEGACY_STORAGE_KEY);
     if (!raw) return false;
 
     const parsed = JSON.parse(raw);
@@ -266,10 +314,18 @@ function renderAttachedFiles() {
   thread.pdfContexts.forEach((item) => {
     const chipEl = document.createElement("div");
     chipEl.className = "attached-chip";
-    chipEl.innerHTML = `
-      <span>${item.filename} (${item.pages ?? "?"}p)</span>
-      <button type="button" data-id="${item.id}" aria-label="Remove ${item.filename}">x</button>
-    `;
+
+    const labelEl = document.createElement("span");
+    labelEl.textContent = `${item.filename} (${item.pages ?? "?"}p)`;
+
+    const removeBtn = document.createElement("button");
+    removeBtn.type = "button";
+    removeBtn.dataset.id = item.id;
+    removeBtn.setAttribute("aria-label", `Remove ${item.filename}`);
+    removeBtn.textContent = "x";
+
+    chipEl.appendChild(labelEl);
+    chipEl.appendChild(removeBtn);
     attachedFilesEl.appendChild(chipEl);
   });
 
@@ -291,9 +347,81 @@ function createThreadActionButton(action, threadId, className, title, svgPath) {
   return button;
 }
 
+function normalizeThreadTitle(value) {
+  const cleaned = String(value || "").trim().replace(/\s+/g, " ");
+  if (!cleaned) return "";
+  return cleaned.length > 80 ? `${cleaned.slice(0, 80)}...` : cleaned;
+}
+
+function isThreadInteractionDisabled() {
+  return isSending || isPdfLoading;
+}
+
+function startRenamingThread(threadId) {
+  if (isThreadInteractionDisabled()) return;
+  if (!getThreadById(threadId)) return;
+  renamingThreadId = threadId;
+  pendingDeleteThreadId = null;
+  renderThreadsList();
+  queueMicrotask(() => {
+    const inputEl = threadsListEl.querySelector(`[data-rename-input="${threadId}"]`);
+    if (!(inputEl instanceof HTMLInputElement)) return;
+    inputEl.focus();
+    inputEl.select();
+  });
+}
+
+function cancelThreadRename() {
+  if (renamingThreadId === null) return;
+  renamingThreadId = null;
+  renderThreadsList();
+}
+
+function commitThreadRename(threadId, nextValue) {
+  const thread = getThreadById(threadId);
+  if (!thread) {
+    renamingThreadId = null;
+    renderThreadsList();
+    return;
+  }
+
+  const nextTitle = normalizeThreadTitle(nextValue);
+  if (!nextTitle) {
+    cancelThreadRename();
+    return;
+  }
+
+  thread.title = nextTitle;
+  touchThread(thread);
+  moveThreadToTop(thread.id);
+  renamingThreadId = null;
+  saveThreadState();
+  renderThreadsList();
+}
+
+function openDeleteModal(threadId) {
+  const thread = getThreadById(threadId);
+  if (!thread || isThreadInteractionDisabled()) return;
+  pendingDeleteThreadId = threadId;
+  renamingThreadId = null;
+  confirmModalDescriptionEl.textContent = `Delete chat "${thread.title || "New chat"}"? This cannot be undone.`;
+  confirmModalEl.classList.remove("hidden");
+  confirmModalEl.setAttribute("aria-hidden", "false");
+  updateUiState();
+  confirmDeleteBtnEl.focus();
+}
+
+function closeDeleteModal() {
+  if (pendingDeleteThreadId === null) return;
+  pendingDeleteThreadId = null;
+  confirmModalEl.classList.add("hidden");
+  confirmModalEl.setAttribute("aria-hidden", "true");
+  updateUiState();
+}
+
 function renderThreadsList() {
   threadsListEl.innerHTML = "";
-  const disabled = isSending || isPdfLoading;
+  const disabled = isThreadInteractionDisabled() || pendingDeleteThreadId !== null;
 
   threads.forEach((thread) => {
     const itemEl = document.createElement("article");
@@ -302,42 +430,87 @@ function renderThreadsList() {
     const rowEl = document.createElement("div");
     rowEl.className = "thread-item-row";
 
-    const openBtn = document.createElement("button");
-    openBtn.type = "button";
-    openBtn.className = "thread-open-btn";
-    openBtn.disabled = disabled;
-    openBtn.dataset.action = "open";
-    openBtn.dataset.threadId = thread.id;
+    const isRenaming = renamingThreadId === thread.id;
+    let openBtn = null;
 
-    const titleEl = document.createElement("span");
-    titleEl.className = "thread-item-title";
-    titleEl.textContent = thread.title || "New chat";
-    openBtn.appendChild(titleEl);
+    if (isRenaming) {
+      const editorWrapEl = document.createElement("form");
+      editorWrapEl.className = "thread-title-editor";
+      editorWrapEl.dataset.threadRenameForm = thread.id;
+
+      const inputEl = document.createElement("input");
+      inputEl.type = "text";
+      inputEl.className = "thread-title-input";
+      inputEl.name = "thread-title";
+      inputEl.value = thread.title || "New chat";
+      inputEl.maxLength = 120;
+      inputEl.disabled = disabled;
+      inputEl.dataset.renameInput = thread.id;
+      inputEl.setAttribute("aria-label", "Rename chat");
+      editorWrapEl.appendChild(inputEl);
+      rowEl.appendChild(editorWrapEl);
+    } else {
+      openBtn = document.createElement("button");
+      openBtn.type = "button";
+      openBtn.className = "thread-open-btn";
+      openBtn.disabled = disabled;
+      openBtn.dataset.action = "open";
+      openBtn.dataset.threadId = thread.id;
+
+      const titleEl = document.createElement("span");
+      titleEl.className = "thread-item-title";
+      titleEl.textContent = thread.title || "New chat";
+      openBtn.appendChild(titleEl);
+      rowEl.appendChild(openBtn);
+    }
 
     const actionsEl = document.createElement("div");
     actionsEl.className = "thread-item-actions";
 
-    const renameBtn = createThreadActionButton(
-      "rename",
-      thread.id,
-      "thread-mini-btn",
-      "Rename chat",
-      "M3 17.25V21h3.75L17.8 9.95l-3.75-3.75L3 17.25zm14.71-9.04a1 1 0 0 0 0-1.41l-1.51-1.51a1 1 0 0 0-1.41 0l-1.17 1.17 3.75 3.75 1.34-1.99z"
-    );
-    renameBtn.disabled = disabled;
+    if (isRenaming) {
+      const saveBtn = createThreadActionButton(
+        "rename-save",
+        thread.id,
+        "thread-mini-btn confirm",
+        "Save title",
+        "M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"
+      );
+      saveBtn.disabled = disabled;
 
-    const deleteBtn = createThreadActionButton(
-      "delete",
-      thread.id,
-      "thread-mini-btn delete",
-      "Delete chat",
-      "M9 3h6l1 2h4v2H4V5h4l1-2zm1 6h2v9h-2V9zm4 0h2v9h-2V9zM7 9h2v9H7V9z"
-    );
-    deleteBtn.disabled = disabled;
+      const cancelBtn = createThreadActionButton(
+        "rename-cancel",
+        thread.id,
+        "thread-mini-btn",
+        "Cancel rename",
+        "M18.3 5.71 12 12l6.3 6.29-1.41 1.42L10.59 13.4 4.29 19.71 2.88 18.3 9.17 12 2.88 5.71 4.29 4.29l6.3 6.3 6.29-6.3z"
+      );
+      cancelBtn.disabled = disabled;
 
-    actionsEl.appendChild(renameBtn);
-    actionsEl.appendChild(deleteBtn);
-    rowEl.appendChild(openBtn);
+      actionsEl.appendChild(saveBtn);
+      actionsEl.appendChild(cancelBtn);
+    } else {
+      const renameBtn = createThreadActionButton(
+        "rename",
+        thread.id,
+        "thread-mini-btn",
+        "Rename chat",
+        "M3 17.25V21h3.75L17.8 9.95l-3.75-3.75L3 17.25zm14.71-9.04a1 1 0 0 0 0-1.41l-1.51-1.51a1 1 0 0 0-1.41 0l-1.17 1.17 3.75 3.75 1.34-1.99z"
+      );
+      renameBtn.disabled = disabled;
+
+      const deleteBtn = createThreadActionButton(
+        "delete",
+        thread.id,
+        "thread-mini-btn delete",
+        "Delete chat",
+        "M9 3h6l1 2h4v2H4V5h4l1-2zm1 6h2v9h-2V9zm4 0h2v9h-2V9zM7 9h2v9H7V9z"
+      );
+      deleteBtn.disabled = disabled;
+
+      actionsEl.appendChild(renameBtn);
+      actionsEl.appendChild(deleteBtn);
+    }
+
     rowEl.appendChild(actionsEl);
 
     const metaEl = document.createElement("span");
@@ -352,14 +525,17 @@ function renderThreadsList() {
 
 function updateUiState() {
   const hasActiveThread = Boolean(getActiveThread());
-  const disabled = isSending || isPdfLoading || !hasActiveThread;
+  const modalOpen = pendingDeleteThreadId !== null;
+  const disabled = isSending || isPdfLoading || !hasActiveThread || modalOpen;
   sendBtnEl.disabled = disabled;
-  promptEl.disabled = isSending || !hasActiveThread;
-  modelEl.disabled = isSending;
-  webSearchBtnEl.disabled = isSending;
+  promptEl.disabled = isSending || !hasActiveThread || modalOpen;
+  modelEl.disabled = isSending || modalOpen;
+  webSearchBtnEl.disabled = isSending || modalOpen;
   attachBtnEl.disabled = disabled;
-  newChatBtnEl.disabled = isSending || isPdfLoading;
+  newChatBtnEl.disabled = isSending || isPdfLoading || modalOpen;
   sendBtnEl.textContent = isSending ? "Sending..." : "Send";
+  confirmCancelBtnEl.disabled = isSending || isPdfLoading;
+  confirmDeleteBtnEl.disabled = isSending || isPdfLoading;
   applyWebSearchUiState();
 
   renderThreadsList();
@@ -378,6 +554,7 @@ function setPdfLoadingState(nextValue) {
 
 function setActiveThread(threadId) {
   if (!threads.some((thread) => thread.id === threadId)) return;
+  renamingThreadId = null;
   activeThreadId = threadId;
   moveThreadToTop(threadId);
   saveThreadState();
@@ -397,35 +574,18 @@ function createAndActivateNewThread() {
   promptEl.focus();
 }
 
-function renameThreadById(threadId) {
-  const thread = getThreadById(threadId);
-  if (!thread) return;
-
-  const nextTitle = window.prompt("Rename chat", thread.title || "New chat");
-  if (nextTitle === null) return;
-
-  const cleaned = nextTitle.trim().replace(/\s+/g, " ");
-  if (!cleaned) return;
-
-  thread.title = cleaned.length > 80 ? `${cleaned.slice(0, 80)}...` : cleaned;
-  touchThread(thread);
-  moveThreadToTop(thread.id);
-  saveThreadState();
-  renderThreadsList();
-}
-
 function deleteThreadById(threadId) {
   const thread = getThreadById(threadId);
   if (!thread) return;
 
-  const confirmed = window.confirm(`Delete chat "${thread.title || "New chat"}"?`);
-  if (!confirmed) return;
-
   const wasActive = thread.id === activeThreadId;
   threads = threads.filter((item) => item.id !== thread.id);
+  pendingDeleteThreadId = null;
 
   if (threads.length === 0) {
     createAndActivateNewThread();
+    confirmModalEl.classList.add("hidden");
+    confirmModalEl.setAttribute("aria-hidden", "true");
     return;
   }
 
@@ -436,6 +596,8 @@ function deleteThreadById(threadId) {
   }
 
   saveThreadState();
+  confirmModalEl.classList.add("hidden");
+  confirmModalEl.setAttribute("aria-hidden", "true");
   renderThreadsList();
 }
 
@@ -547,15 +709,28 @@ async function loadModels() {
       return;
     }
 
+    const preferredModel = loadSelectedModelPreference();
+    let selectedModel = "";
+
     models.forEach((entry, index) => {
       const option = document.createElement("option");
       option.value = entry.model;
       option.textContent = entry.name || entry.model;
-      if (index === 0) {
+      if ((preferredModel && entry.model === preferredModel) || (!preferredModel && index === 0)) {
         option.selected = true;
+        selectedModel = entry.model;
       }
       modelEl.appendChild(option);
     });
+
+    if (!selectedModel && models[0]?.model) {
+      modelEl.value = models[0].model;
+      selectedModel = models[0].model;
+    }
+
+    if (selectedModel) {
+      saveSelectedModelPreference(selectedModel);
+    }
   } catch (error) {
     addMessage("system", `Could not load models: ${error.message}`);
   }
@@ -736,6 +911,13 @@ formEl.addEventListener("submit", async (event) => {
   promptEl.focus();
 });
 
+promptEl.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" || event.shiftKey) return;
+  event.preventDefault();
+  if (sendBtnEl.disabled) return;
+  formEl.requestSubmit();
+});
+
 pdfFileEl.addEventListener("change", async (event) => {
   const file = event.target.files?.[0];
   await attachPdf(file);
@@ -753,6 +935,39 @@ attachedFilesEl.addEventListener("click", (event) => {
   removePdfContext(target.dataset.id);
 });
 
+threadsListEl.addEventListener("submit", (event) => {
+  const form = event.target;
+  if (!(form instanceof HTMLFormElement)) return;
+  const threadId = form.dataset.threadRenameForm;
+  if (!threadId) return;
+  event.preventDefault();
+  const inputEl = form.querySelector("input[name='thread-title']");
+  if (!(inputEl instanceof HTMLInputElement)) return;
+  commitThreadRename(threadId, inputEl.value);
+  updateUiState();
+});
+
+threadsListEl.addEventListener("keydown", (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLInputElement) || !target.matches("[data-rename-input]")) return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    cancelThreadRename();
+    updateUiState();
+  }
+});
+
+threadsListEl.addEventListener("focusout", (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLInputElement) || !target.matches("[data-rename-input]")) return;
+  const relatedTarget = event.relatedTarget;
+  if (relatedTarget instanceof Element && relatedTarget.closest(".thread-item-actions")) {
+    return;
+  }
+  commitThreadRename(target.dataset.renameInput, target.value);
+  updateUiState();
+});
+
 newChatBtnEl.addEventListener("click", () => {
   if (newChatBtnEl.disabled) return;
   createAndActivateNewThread();
@@ -764,6 +979,10 @@ webSearchBtnEl.addEventListener("click", () => {
   webSearchEnabled = !webSearchEnabled;
   saveWebSearchPreference(webSearchEnabled);
   applyWebSearchUiState();
+});
+
+modelEl.addEventListener("change", () => {
+  saveSelectedModelPreference(modelEl.value);
 });
 
 threadsListEl.addEventListener("click", (event) => {
@@ -780,12 +999,44 @@ threadsListEl.addEventListener("click", (event) => {
   if (action === "open") {
     setActiveThread(threadId);
   } else if (action === "rename") {
-    renameThreadById(threadId);
+    startRenamingThread(threadId);
+  } else if (action === "rename-save") {
+    const inputEl = threadsListEl.querySelector(`[data-rename-input="${threadId}"]`);
+    if (inputEl instanceof HTMLInputElement) {
+      commitThreadRename(threadId, inputEl.value);
+    }
+  } else if (action === "rename-cancel") {
+    cancelThreadRename();
   } else if (action === "delete") {
-    deleteThreadById(threadId);
+    openDeleteModal(threadId);
   }
 
   updateUiState();
+});
+
+confirmModalEl.addEventListener("click", (event) => {
+  const target = event.target;
+  if (!(target instanceof Element)) return;
+  if (target.closest("[data-close-modal='true']")) {
+    closeDeleteModal();
+  }
+});
+
+confirmCancelBtnEl.addEventListener("click", () => {
+  closeDeleteModal();
+});
+
+confirmDeleteBtnEl.addEventListener("click", () => {
+  if (pendingDeleteThreadId) {
+    deleteThreadById(pendingDeleteThreadId);
+    updateUiState();
+  }
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && pendingDeleteThreadId !== null) {
+    closeDeleteModal();
+  }
 });
 
 if (!loadThreadState()) {
