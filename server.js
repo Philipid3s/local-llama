@@ -4,6 +4,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { URL } = require("node:url");
 const { ChromaClient } = require("chromadb");
+const mammoth = require("mammoth");
 const { PDFParse } = require("pdf-parse");
 const { createWorker } = require("tesseract.js");
 
@@ -13,8 +14,8 @@ const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || "http://localhost:11434";
 const PUBLIC_DIR = path.join(__dirname, "public");
 const NODE_MODULES_DIR = path.join(__dirname, "node_modules");
 const MAX_JSON_BYTES = 1_000_000;
-const MAX_PDF_JSON_BYTES = 15_000_000;
-const MAX_PDF_BYTES = 10_000_000;
+const MAX_DOCUMENT_JSON_BYTES = 15_000_000;
+const MAX_DOCUMENT_BYTES = 10_000_000;
 const OLLAMA_EMBED_MODEL =
   process.env.OLLAMA_EMBEDDING_MODEL ||
   process.env.OLLAMA_EMBED_MODEL ||
@@ -59,6 +60,23 @@ const MIME_TYPES = {
   ".png": "image/png",
   ".svg": "image/svg+xml",
   ".ico": "image/x-icon"
+};
+
+const SUPPORTED_DOCUMENT_TYPES = {
+  pdf: {
+    extensions: [".pdf"],
+    mimeTypes: ["application/pdf"],
+    fallbackMimeType: "application/pdf",
+    defaultFilename: "document.pdf"
+  },
+  docx: {
+    extensions: [".docx"],
+    mimeTypes: [
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    ],
+    fallbackMimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    defaultFilename: "document.docx"
+  }
 };
 
 function sendJson(res, statusCode, payload) {
@@ -107,6 +125,20 @@ function createHttpError(status, message) {
   const error = new Error(message);
   error.status = status;
   return error;
+}
+
+function getDocumentType({ filename, mimeType }) {
+  const normalizedFilename = String(filename || "").trim().toLowerCase();
+  const extension = path.extname(normalizedFilename);
+  const normalizedMimeType = String(mimeType || "").trim().toLowerCase();
+
+  for (const [documentType, config] of Object.entries(SUPPORTED_DOCUMENT_TYPES)) {
+    if (config.extensions.includes(extension) || (normalizedMimeType && config.mimeTypes.includes(normalizedMimeType))) {
+      return documentType;
+    }
+  }
+
+  return null;
 }
 
 function parseVectorInstancesFromEnv() {
@@ -435,7 +467,7 @@ function summarizeLibraryRows(rows) {
     if (!docs.has(documentId)) {
       docs.set(documentId, {
         documentId,
-        filename: metadata.filename || "document.pdf",
+        filename: metadata.filename || "document",
         pages: Number(metadata.pages) >= 0 ? Number(metadata.pages) : null,
         chunkCount: 0,
         totalChars: 0
@@ -796,9 +828,58 @@ function readJsonBody(req, maxBytes = MAX_JSON_BYTES) {
   });
 }
 
-async function handlePdfExtract(req, res) {
+async function extractPdfDocument(fileBuffer) {
+  const parser = new PDFParse({ data: fileBuffer });
+  let extracted;
+  let text = "";
+  let extractionMethod = "text";
+
   try {
-    const body = await readJsonBody(req, MAX_PDF_JSON_BYTES);
+    extracted = await parser.getText();
+    text = (extracted.text || "").replace(/\r\n/g, "\n").trim();
+
+    const shouldTryOcr = OCR_ENABLED && text.length < OCR_MIN_TEXT_CHARS;
+    if (shouldTryOcr) {
+      try {
+        const ocrText = await runPdfOcr(parser, extracted.total || null);
+        if (ocrText) {
+          if (text) {
+            text = `${text}\n\n${ocrText}`.trim();
+            extractionMethod = "mixed";
+          } else {
+            text = ocrText;
+            extractionMethod = "ocr";
+          }
+        }
+      } catch (ocrError) {
+        if (!text) {
+          throw new Error(`OCR fallback failed: ${ocrError.message || "unknown OCR error"}`);
+        }
+      }
+    }
+  } finally {
+    await parser.destroy();
+  }
+
+  return {
+    text,
+    pages: extracted?.total || null,
+    extractionMethod
+  };
+}
+
+async function extractDocxDocument(fileBuffer) {
+  const extracted = await mammoth.extractRawText({ buffer: fileBuffer });
+  return {
+    text: normalizeWhitespace(extracted.value || ""),
+    pages: null,
+    extractionMethod: "text"
+  };
+}
+
+async function handleDocumentExtract(req, res) {
+  try {
+    const body = await readJsonBody(req, MAX_DOCUMENT_JSON_BYTES);
     const { filename, mimeType, dataBase64 } = body;
 
     if (!dataBase64 || typeof dataBase64 !== "string") {
@@ -806,63 +887,39 @@ async function handlePdfExtract(req, res) {
       return;
     }
 
-    if (mimeType && mimeType !== "application/pdf") {
-      sendJson(res, 400, { error: "Only PDF files are supported." });
+    const documentType = getDocumentType({ filename, mimeType });
+    if (!documentType) {
+      sendJson(res, 400, { error: "Only .pdf and .docx files are supported." });
       return;
     }
 
     const fileBuffer = Buffer.from(dataBase64, "base64");
-    if (fileBuffer.length > MAX_PDF_BYTES) {
+    if (fileBuffer.length > MAX_DOCUMENT_BYTES) {
       sendJson(res, 413, {
-        error: `PDF is too large. Max supported size is ${Math.floor(MAX_PDF_BYTES / 1_000_000)}MB.`
+        error: `Document is too large. Max supported size is ${Math.floor(MAX_DOCUMENT_BYTES / 1_000_000)}MB.`
       });
       return;
     }
 
-    const parser = new PDFParse({ data: fileBuffer });
-    let extracted;
-    let text = "";
-    let extractionMethod = "text";
-    try {
-      extracted = await parser.getText();
-      text = (extracted.text || "").replace(/\r\n/g, "\n").trim();
-
-      const shouldTryOcr = OCR_ENABLED && text.length < OCR_MIN_TEXT_CHARS;
-      if (shouldTryOcr) {
-        try {
-          const ocrText = await runPdfOcr(parser, extracted.total || null);
-          if (ocrText) {
-            if (text) {
-              text = `${text}\n\n${ocrText}`.trim();
-              extractionMethod = "mixed";
-            } else {
-              text = ocrText;
-              extractionMethod = "ocr";
-            }
-          }
-        } catch (ocrError) {
-          if (!text) {
-            throw new Error(`OCR fallback failed: ${ocrError.message || "unknown OCR error"}`);
-          }
-        }
-      }
-    } finally {
-      await parser.destroy();
-    }
+    const extracted =
+      documentType === "pdf" ? await extractPdfDocument(fileBuffer) : await extractDocxDocument(fileBuffer);
+    const text = normalizeWhitespace(extracted.text || "");
 
     if (!text) {
-      sendJson(res, 422, { error: "No extractable text found in this PDF." });
+      sendJson(res, 422, { error: `No extractable text found in this ${documentType.toUpperCase()} file.` });
       return;
     }
 
     sendJson(res, 200, {
-      filename: filename || "document.pdf",
-      pages: extracted.total || null,
-      extractionMethod,
+      filename: filename || SUPPORTED_DOCUMENT_TYPES[documentType].defaultFilename,
+      pages: extracted.pages,
+      extractionMethod: extracted.extractionMethod,
+      documentType,
+      mimeType: SUPPORTED_DOCUMENT_TYPES[documentType].fallbackMimeType,
       text
     });
   } catch (error) {
-    sendJson(res, 500, { error: error.message || "Failed to process PDF." });
+    sendJson(res, 500, { error: error.message || "Failed to process document." });
   }
 }
 
@@ -899,7 +956,7 @@ async function handleVectorTest(req, res, parsedUrl) {
 
 async function handleRagIngest(req, res) {
   try {
-    const body = await readJsonBody(req, MAX_PDF_JSON_BYTES);
+    const body = await readJsonBody(req, MAX_DOCUMENT_JSON_BYTES);
     const { vectorInstanceId, documentId, filename, pages, text } = body;
     const instance = getVectorInstanceConfig(vectorInstanceId);
     const result = await ingestDocumentIntoRag({ instanceId: instance.id, documentId, filename, pages, text });
@@ -1205,8 +1262,8 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (req.method === "POST" && parsedUrl.pathname === "/api/pdf/extract") {
-    await handlePdfExtract(req, res);
+  if (req.method === "POST" && (parsedUrl.pathname === "/api/document/extract" || parsedUrl.pathname === "/api/pdf/extract")) {
+    await handleDocumentExtract(req, res);
     return;
   }
 

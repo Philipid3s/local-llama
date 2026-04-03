@@ -350,7 +350,7 @@ function renderMessages() {
   if (!thread) return;
 
   if (thread.history.length === 0) {
-    addMessage("system", "New chat ready. Attach a PDF for session context or add a PDF to the knowledge base.");
+    addMessage("system", "New chat ready. Attach a PDF or DOCX for session context, or add one to the knowledge base.");
     return;
   }
 
@@ -370,7 +370,7 @@ function renderAttachedFiles() {
 
     const labelEl = document.createElement("span");
     labelEl.className = "attached-chip-title";
-    labelEl.textContent = `${item.filename} (${item.pages ?? "?"}p)`;
+    labelEl.textContent = buildDocumentSummaryLabel(item);
 
     const statusEl = document.createElement("span");
     statusEl.className = "attached-chip-status pending";
@@ -693,7 +693,7 @@ function buildChatMessages(thread) {
     {
       role: "system",
       content:
-        "Use the attached PDF text as session-only context for this chat. If the attachment does not contain the answer, say so clearly."
+        "Use the attached document text as session-only context for this chat. If the attachment does not contain the answer, say so clearly."
     }
   ];
 
@@ -717,8 +717,8 @@ function buildChatMessages(thread) {
     contextMessages.push({
       role: "system",
       content: [
-        `PDF filename: ${ctx.filename}`,
-        `Pages: ${ctx.pages ?? "unknown"}`,
+        `Document filename: ${ctx.filename}`,
+        typeof ctx.pages === "number" ? `Pages: ${ctx.pages}` : "Pages: not available",
         isTruncated ? `Text was truncated to ${availableChars} characters.` : "Full extracted text included.",
         "",
         textForModel
@@ -729,7 +729,7 @@ function buildChatMessages(thread) {
   if (truncatedCount > 0) {
     contextMessages.push({
       role: "system",
-      content: `${truncatedCount} attached PDF document(s) were partially or fully truncated due to session context limits.`
+      content: `${truncatedCount} attached document(s) were partially or fully truncated due to session context limits.`
     });
   }
 
@@ -1036,14 +1036,32 @@ async function loadVectorInstances() {
   }
 }
 
+function getSupportedDocumentType(file) {
+  if (!file) return null;
+  const name = file.name.toLowerCase();
+  const type = (file.type || "").toLowerCase();
+  if (type === "application/pdf" || name.endsWith(".pdf")) return "pdf";
+  if (
+    type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
+    name.endsWith(".docx")
+  ) {
+    return "docx";
+  }
+  return null;
+}
+
+function buildDocumentSummaryLabel(doc) {
+  return typeof doc.pages === "number" ? `${doc.filename} (${doc.pages}p)` : doc.filename;
+}
+
 async function attachPdf(file) {
   if (!file) return;
   const thread = getActiveThread();
   if (!thread) return;
 
-  const isPdf = file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
-  if (!isPdf) {
-    addMessage("system", "Only .pdf files are supported.");
+  const documentType = getSupportedDocumentType(file);
+  if (!documentType) {
+    addMessage("system", "Only .pdf and .docx files are supported.");
     return;
   }
 
@@ -1059,6 +1077,7 @@ async function attachPdf(file) {
     thread.pdfContexts.push({
       id: crypto.randomUUID(),
       filename: data.filename || file.name,
+      documentType: data.documentType || documentType,
       pages: data.pages,
       text: trimmedText,
       extractionMethod: data.extractionMethod || "text",
@@ -1081,12 +1100,12 @@ async function attachPdf(file) {
           : "";
     addMessage(
       "system",
-      `Attached "${attached.filename}" (${attached.pages ?? "?"} pages) to the current chat.${extractionInfo}${
+      `Attached "${buildDocumentSummaryLabel(attached)}" to the current chat.${extractionInfo}${
         storageTrimmed ? " Stored text was truncated to keep local history size manageable." : ""
-      }${contextTruncated ? " Very large PDFs may be truncated during chat context injection." : ""}`
+      }${contextTruncated ? " Very large documents may be truncated during chat context injection." : ""}`
     );
   } catch (error) {
-    addMessage("system", `PDF attach error: ${error.message}`);
+    addMessage("system", `Document attach error: ${error.message}`);
   } finally {
     setPdfLoadingState(false);
     pdfFileEl.value = "";
@@ -1118,27 +1137,54 @@ function maybeUpdateThreadTitle(thread, userText) {
 async function extractPdfFile(file) {
   const arrayBuffer = await file.arrayBuffer();
   const dataBase64 = toBase64(arrayBuffer);
-  const res = await fetch("/api/pdf/extract", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      filename: file.name,
-      mimeType: file.type || "application/pdf",
-      dataBase64
-    })
+
+  const requestBody = JSON.stringify({
+    filename: file.name,
+    mimeType: file.type || undefined,
+    dataBase64
   });
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(data.error || "Could not extract text from PDF.");
+
+  async function postExtract(url) {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: requestBody
+    });
+
+    const raw = await res.text();
+    let data;
+    try {
+      data = raw ? JSON.parse(raw) : {};
+    } catch {
+      data = null;
+    }
+
+    return { res, data, raw };
   }
-  return data;
+
+  let result = await postExtract("/api/document/extract");
+  const shouldRetryLegacy =
+    !result.res.ok &&
+    (result.res.status === 404 || result.res.status === 405 || result.data === null);
+
+  if (shouldRetryLegacy) {
+    result = await postExtract("/api/pdf/extract");
+  }
+
+  if (!result.data) {
+    throw new Error(result.raw || "Could not extract text from document.");
+  }
+
+  if (!result.res.ok) {
+    throw new Error(result.data.error || "Could not extract text from document.");
+  }
+  return result.data;
 }
 
 async function addPdfToLibrary(file) {
   if (!file) return;
-  const isPdf = file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
-  if (!isPdf) {
-    addMessage("system", "Only .pdf files are supported.");
+  if (!getSupportedDocumentType(file)) {
+    addMessage("system", "Only .pdf and .docx files are supported.");
     return;
   }
 

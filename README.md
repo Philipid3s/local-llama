@@ -1,6 +1,6 @@
 # bonsAI - local ollama client
 
-A lightweight, private, and powerful web interface for your local Ollama models. Chat with your favorite AI models, analyze PDF documents with OCR support, and ground responses with real-time web search from a clean, responsive UI.
+A lightweight, private, and powerful web interface for your local Ollama models. Chat with your favorite AI models, analyze PDF and DOCX documents with OCR support for PDFs, and ground responses with real-time web search from a clean, responsive UI.
 
 ---
 
@@ -14,8 +14,8 @@ A lightweight, private, and powerful web interface for your local Ollama models.
 - **Local Persistence**: All chat history and document context are stored in your browser's `localStorage` for privacy and speed.
 
 ### Document Intelligence
-- **Session PDFs**: Attach a PDF to the active chat and use it as temporary thread-only context.
-- **Knowledge Library**: Add a PDF permanently to the selected Chroma-backed knowledge base, then query it from any future chat.
+- **Session Documents**: Attach a PDF or DOCX file to the active chat and use it as temporary thread-only context.
+- **Knowledge Library**: Add a PDF or DOCX file permanently to the selected Chroma-backed knowledge base, then query it from any future chat.
 - **OCR Fallback**: Built-in OCR support using `Tesseract.js`. If a PDF is scanned or image-heavy, the system automatically falls back to OCR so the AI can read the content.
 - **Knowledge-Base Retrieval**: Toggle `KB` to force retrieval from the selected vector instance during chat.
 
@@ -32,7 +32,7 @@ A lightweight, private, and powerful web interface for your local Ollama models.
 - **Frontend**: Vanilla JavaScript, CSS3, HTML5
 - **AI Core**: [Ollama](https://ollama.com/)
 - **Vector Store**: [Chroma](https://www.trychroma.com/)
-- **Document Processing**: `pdf-parse`, `tesseract.js`
+- **Document Processing**: `mammoth`, `pdf-parse`, `tesseract.js`
 - **Web Search**: Brave Search API
 
 ---
@@ -155,7 +155,7 @@ Typical usage:
 | :--- | :--- | :--- |
 | `PORT` | `3000` | The port the web server listens on. |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | The URL where your Ollama instance is running. |
-| `OCR_ENABLED` | `true` | Enable or disable OCR fallback for PDF documents. |
+| `OCR_ENABLED` | `true` | Enable or disable OCR fallback for PDF documents. DOCX extraction is text-only. |
 | `OCR_LANG` | `eng` | Language code for OCR downloads on first run. |
 | `OCR_MAX_PAGES` | `3` | Maximum number of pages to process via OCR per document. |
 | `OCR_MIN_TEXT_CHARS` | `80` | Minimum text length before OCR fallback is triggered. |
@@ -172,7 +172,7 @@ Typical usage:
 | `CHROMA_SSL` | `false` | Whether to connect to Chroma over HTTPS. |
 | `CHROMA_COLLECTION` | `bonsai_documents` | Collection name used for indexed documents. |
 | `VECTOR_DB_INSTANCES` | `(empty)` | Optional JSON array of named vector instances for the header selector. If omitted, the single `CHROMA_*` config becomes the default instance. |
-| `RAG_CHUNK_SIZE` | `1200` | Approximate chunk size, in characters, for PDF text splitting. |
+| `RAG_CHUNK_SIZE` | `1200` | Approximate chunk size, in characters, for extracted document text splitting. |
 | `RAG_CHUNK_OVERLAP` | `180` | Character overlap between adjacent chunks. |
 | `RAG_RETRIEVAL_LIMIT` | `4` | Number of retrieved chunks added to each chat request. |
 | `EMBED_BATCH_SIZE` | `16` | Number of chunks embedded per Ollama batch request. |
@@ -181,8 +181,8 @@ Typical usage:
 
 ## Usage Tips
 
-- **Session PDF**: Click `PDF` to attach a document only to the current chat thread.
-- **Permanent Knowledge Base**: Click `Library` to ingest a PDF into the selected knowledge base. That data stays in Chroma until you remove/reset it outside the app.
+- **Session Document**: Click `PDF` to attach a PDF or DOCX document only to the current chat thread.
+- **Permanent Knowledge Base**: Click `Library` to ingest a PDF or DOCX document into the selected knowledge base. That data stays in Chroma until you remove/reset it outside the app.
 - **Delete from KB**: Open `Browse` next to the knowledge base selector to inspect indexed files, run a connection test, or delete a document from the selected knowledge base.
 - **KB Search**: Toggle `KB` on when you want the model to retrieve from the selected knowledge base for the current prompt.
 
@@ -211,7 +211,7 @@ You can expose multiple Chroma-backed knowledge bases in the header selector wit
 ]
 ```
 - **Web Search**: Useful for current events or technical documentation released after your model's training cutoff.
-- **Storage**: If you hit a storage warning, try deleting older threads or removing large PDF attachments.
+- **Storage**: If you hit a storage warning, try deleting older threads or removing large document attachments.
 
 ---
 
