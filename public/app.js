@@ -4,6 +4,7 @@ const promptEl = document.getElementById("prompt");
 const sendBtnEl = document.getElementById("send-btn");
 const modelEl = document.getElementById("model");
 const vectorInstanceEl = document.getElementById("vector-instance");
+const sourceFilterEl = document.getElementById("source-filter");
 const vectorLibraryBtnEl = document.getElementById("vector-library-btn");
 const webSearchBtnEl = document.getElementById("web-search-btn");
 const vectorSearchBtnEl = document.getElementById("vector-search-btn");
@@ -31,6 +32,7 @@ const WEB_SEARCH_TOGGLE_KEY = "bonsai_web_search_enabled";
 const VECTOR_SEARCH_TOGGLE_KEY = "bonsai_vector_search_enabled";
 const MODEL_SELECTION_KEY = "bonsai_selected_model";
 const VECTOR_INSTANCE_SELECTION_KEY = "bonsai_selected_vector_instance";
+const SOURCE_FILTER_SELECTION_KEY = "bonsai_source_filter";
 const LEGACY_STORAGE_KEY = "localllama_threads_v1";
 const LEGACY_WEB_SEARCH_TOGGLE_KEY = "localllama_web_search_enabled";
 const LEGACY_MODEL_SELECTION_KEY = "localllama_selected_model";
@@ -49,6 +51,8 @@ let pendingDeleteThreadId = null;
 let vectorInstances = [];
 let isVectorLibraryLoading = false;
 let isVectorConnectionTesting = false;
+let modelLoadRetryTimer = null;
+let hasShownModelLoadError = false;
 
 // Global Markdown configuration
 if (typeof marked !== "undefined") {
@@ -182,6 +186,38 @@ function saveSelectedVectorInstancePreference(instanceId) {
   }
 }
 
+function loadSourceFilterPreference() {
+  return readLocalStorage(SOURCE_FILTER_SELECTION_KEY) || "all";
+}
+
+function saveSourceFilterPreference(value) {
+  try {
+    localStorage.setItem(SOURCE_FILTER_SELECTION_KEY, String(value || "all"));
+  } catch {
+    // Ignore localStorage failures for this preference.
+  }
+}
+
+function setModelSelectPlaceholder(label, disabled = true) {
+  modelEl.innerHTML = "";
+  const option = document.createElement("option");
+  option.value = "";
+  option.textContent = label;
+  option.selected = true;
+  modelEl.appendChild(option);
+  modelEl.disabled = disabled;
+}
+
+function scheduleModelReload(delayMs = 3000) {
+  if (modelLoadRetryTimer !== null) {
+    clearTimeout(modelLoadRetryTimer);
+  }
+  modelLoadRetryTimer = setTimeout(() => {
+    modelLoadRetryTimer = null;
+    loadModels({ silent: true });
+  }, delayMs);
+}
+
 function applyWebSearchUiState() {
   webSearchBtnEl.classList.toggle("active", webSearchEnabled);
   webSearchBtnEl.setAttribute("aria-pressed", webSearchEnabled ? "true" : "false");
@@ -194,6 +230,10 @@ function applyVectorSearchUiState() {
 
 function getSelectedVectorInstanceId() {
   return vectorInstanceEl.value || vectorInstances[0]?.id || "";
+}
+
+function getSelectedSourceFilter() {
+  return sourceFilterEl.value || "all";
 }
 
 function createThread() {
@@ -334,8 +374,34 @@ function addMessage(role, text) {
   return messageEl;
 }
 
+function setAssistantThinkingState(messageEl, active) {
+  if (!messageEl.classList.contains("assistant")) return;
+  messageEl.classList.toggle("thinking", active);
+  if (active) {
+    if (!messageEl.querySelector(".thinking-indicator")) {
+      const indicatorEl = document.createElement("div");
+      indicatorEl.className = "thinking-indicator";
+      indicatorEl.setAttribute("aria-label", "Assistant is thinking");
+      indicatorEl.innerHTML = `
+        <span class="thinking-label">Thinking</span>
+        <span class="thinking-dots" aria-hidden="true">
+          <span></span><span></span><span></span>
+        </span>
+      `;
+      messageEl.appendChild(indicatorEl);
+    }
+    return;
+  }
+
+  const indicatorEl = messageEl.querySelector(".thinking-indicator");
+  if (indicatorEl) {
+    indicatorEl.remove();
+  }
+}
+
 function appendMessageContent(messageEl, content) {
   if (messageEl.classList.contains("assistant")) {
+    setAssistantThinkingState(messageEl, false);
     const nextText = (messageEl.dataset.rawText || "") + content;
     setMessageContent(messageEl, "assistant", nextText);
   } else {
@@ -350,7 +416,7 @@ function renderMessages() {
   if (!thread) return;
 
   if (thread.history.length === 0) {
-    addMessage("system", "New chat ready. Attach a PDF or DOCX for session context, or add one to the knowledge base.");
+    addMessage("system", "New chat ready. Attach a PDF, DOCX, or JSON file for session context, or add one to the knowledge base.");
     return;
   }
 
@@ -597,6 +663,7 @@ function updateUiState() {
   promptEl.disabled = isSending || !hasActiveThread || modalOpen || libraryModalOpen;
   modelEl.disabled = isSending || modalOpen || libraryModalOpen;
   vectorInstanceEl.disabled = isSending || isPdfLoading || modalOpen || libraryModalOpen || vectorInstances.length === 0;
+  sourceFilterEl.disabled = isSending || isPdfLoading || modalOpen || libraryModalOpen;
   vectorLibraryBtnEl.disabled = isSending || isPdfLoading || modalOpen || vectorInstances.length === 0 || isVectorLibraryLoading;
   vectorLibraryTestBtnEl.disabled = isSending || isPdfLoading || modalOpen || isVectorLibraryLoading || isVectorConnectionTesting;
   webSearchBtnEl.disabled = isSending || modalOpen || libraryModalOpen;
@@ -944,19 +1011,33 @@ async function runVectorConnectionTest() {
   }
 }
 
-async function loadModels() {
+async function loadModels({ silent = false } = {}) {
+  setModelSelectPlaceholder("Loading models...");
+
   try {
     const res = await fetch("/api/models");
     const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.error || "Could not load models.");
+    }
 
     const models = data.models || [];
     if (!models.length) {
-      addMessage("system", "No local models found. Run `ollama pull <model>` first.");
+      setModelSelectPlaceholder("No models found");
+      if (!silent) {
+        addMessage("system", "No local models found. Run `ollama pull <model>` first.");
+      }
       return;
     }
 
+    if (modelLoadRetryTimer !== null) {
+      clearTimeout(modelLoadRetryTimer);
+      modelLoadRetryTimer = null;
+    }
+    hasShownModelLoadError = false;
     const preferredModel = loadSelectedModelPreference();
     let selectedModel = "";
+    modelEl.innerHTML = "";
 
     models.forEach((entry, index) => {
       const option = document.createElement("option");
@@ -977,8 +1058,14 @@ async function loadModels() {
     if (selectedModel) {
       saveSelectedModelPreference(selectedModel);
     }
+    modelEl.disabled = false;
   } catch (error) {
-    addMessage("system", `Could not load models: ${error.message}`);
+    setModelSelectPlaceholder("Waiting for Ollama...");
+    if (!silent && !hasShownModelLoadError) {
+      hasShownModelLoadError = true;
+      addMessage("system", `Could not load models yet: ${error.message}`);
+    }
+    scheduleModelReload();
   }
 }
 
@@ -1047,6 +1134,9 @@ function getSupportedDocumentType(file) {
   ) {
     return "docx";
   }
+  if (type === "application/json" || type === "text/json" || name.endsWith(".json")) {
+    return "json";
+  }
   return null;
 }
 
@@ -1061,7 +1151,7 @@ async function attachPdf(file) {
 
   const documentType = getSupportedDocumentType(file);
   if (!documentType) {
-    addMessage("system", "Only .pdf and .docx files are supported.");
+    addMessage("system", "Only .pdf, .docx, and .json files are supported.");
     return;
   }
 
@@ -1184,23 +1274,23 @@ async function extractPdfFile(file) {
 async function addPdfToLibrary(file) {
   if (!file) return;
   if (!getSupportedDocumentType(file)) {
-    addMessage("system", "Only .pdf and .docx files are supported.");
+    addMessage("system", "Only .pdf, .docx, and .json files are supported.");
     return;
   }
 
   setPdfLoadingState(true);
 
   try {
-    const extracted = await extractPdfFile(file);
-    const rawText = extracted.text || "";
+    const arrayBuffer = await file.arrayBuffer();
+    const dataBase64 = toBase64(arrayBuffer);
     const res = await fetch("/api/rag/ingest", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         vectorInstanceId: getSelectedVectorInstanceId(),
-        filename: extracted.filename || file.name,
-        pages: extracted.pages,
-        text: rawText
+        filename: file.name,
+        mimeType: file.type || undefined,
+        dataBase64
       })
     });
     const data = await res.json();
@@ -1209,14 +1299,20 @@ async function addPdfToLibrary(file) {
     }
 
     const extractionInfo =
-      extracted.extractionMethod === "ocr"
+      data.extractionMethod === "ocr"
         ? " OCR fallback was used."
-        : extracted.extractionMethod === "mixed"
+        : data.extractionMethod === "mixed"
           ? " OCR fallback supplemented extracted text."
+          : "";
+    const ingestInfo =
+      data.documentType === "json" && data.jsonFormat === "devops-tickets" && data.ticketCount
+        ? ` (${data.ticketCount} tickets, ${data.chunkCount} records)`
+        : data.chunkCount
+          ? ` (${data.chunkCount} chunks)`
           : "";
     addMessage(
       "system",
-      `Added "${data.filename}" to knowledge base "${data.vectorInstanceName}"${data.chunkCount ? ` (${data.chunkCount} chunks)` : ""}.${extractionInfo}`
+      `Added "${data.filename}" to knowledge base "${data.vectorInstanceName}"${ingestInfo}.${extractionInfo}`
     );
   } catch (error) {
     addMessage("system", `Knowledge base add error: ${error.message}`);
@@ -1246,6 +1342,7 @@ async function sendChatMessage(userText) {
 
   setSendingState(true);
   const assistantEl = addMessage("assistant", "");
+  setAssistantThinkingState(assistantEl, true);
   let reply = "";
 
   try {
@@ -1258,7 +1355,8 @@ async function sendChatMessage(userText) {
         webSearchEnabled: webSearchEnabled,
         webSearchQuery: userText,
         vectorSearchEnabled: vectorSearchEnabled,
-        vectorInstanceId: getSelectedVectorInstanceId()
+        vectorInstanceId: getSelectedVectorInstanceId(),
+        sourceFilter: getSelectedSourceFilter()
       })
     });
 
@@ -1277,6 +1375,7 @@ async function sendChatMessage(userText) {
     });
 
     if (!reply.trim()) {
+      setAssistantThinkingState(assistantEl, false);
       reply = "(No response content)";
       setMessageContent(assistantEl, "assistant", reply);
     }
@@ -1288,12 +1387,14 @@ async function sendChatMessage(userText) {
     renderThreadsList();
   } catch (error) {
     if (reply.trim()) {
+      setAssistantThinkingState(assistantEl, false);
       thread.history.push({ role: "assistant", content: reply });
       touchThread(thread);
       saveThreadState();
       renderThreadsList();
       addMessage("system", `Stream interrupted: ${error.message}`);
     } else {
+      setAssistantThinkingState(assistantEl, false);
       assistantEl.remove();
       addMessage("system", `Error: ${error.message}`);
     }
@@ -1422,6 +1523,10 @@ vectorInstanceEl.addEventListener("change", () => {
   saveSelectedVectorInstancePreference(vectorInstanceEl.value);
 });
 
+sourceFilterEl.addEventListener("change", () => {
+  saveSourceFilterPreference(sourceFilterEl.value);
+});
+
 threadsListEl.addEventListener("click", (event) => {
   const target = event.target;
   if (!(target instanceof Element)) return;
@@ -1512,6 +1617,7 @@ applyVectorSearchUiState();
 renderThreadsList();
 renderMessages();
 renderAttachedFiles();
+sourceFilterEl.value = loadSourceFilterPreference();
 updateUiState();
 loadModels();
 loadVectorInstances();

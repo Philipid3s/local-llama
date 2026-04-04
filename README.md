@@ -14,8 +14,8 @@ A lightweight, private, and powerful web interface for your local Ollama models.
 - **Local Persistence**: All chat history and document context are stored in your browser's `localStorage` for privacy and speed.
 
 ### Document Intelligence
-- **Session Documents**: Attach a PDF or DOCX file to the active chat and use it as temporary thread-only context.
-- **Knowledge Library**: Add a PDF or DOCX file permanently to the selected Chroma-backed knowledge base, then query it from any future chat.
+- **Session Documents**: Attach a PDF, DOCX, or JSON file to the active chat and use it as temporary thread-only context.
+- **Knowledge Library**: Add a PDF, DOCX, or JSON file permanently to the selected Chroma-backed knowledge base, then query it from any future chat.
 - **OCR Fallback**: Built-in OCR support using `Tesseract.js`. If a PDF is scanned or image-heavy, the system automatically falls back to OCR so the AI can read the content.
 - **Knowledge-Base Retrieval**: Toggle `KB` to force retrieval from the selected vector instance during chat.
 
@@ -175,16 +175,28 @@ Typical usage:
 | `RAG_CHUNK_SIZE` | `1200` | Approximate chunk size, in characters, for extracted document text splitting. |
 | `RAG_CHUNK_OVERLAP` | `180` | Character overlap between adjacent chunks. |
 | `RAG_RETRIEVAL_LIMIT` | `4` | Number of retrieved chunks added to each chat request. |
+| `RAG_QUERY_CANDIDATE_LIMIT` | `12` | Number of nearest-neighbor candidates fetched before local reranking prefers stronger lexical and ticket-focused matches. |
+| `RAG_MAX_CONTEXT_CHARS_PER_EXCERPT` | `1600` | Maximum characters from each retrieved excerpt inserted into the model prompt; long excerpts are compressed to keep both the start and the latest tail content while reducing Ollama/CUDA failures from oversized context. |
 | `EMBED_BATCH_SIZE` | `16` | Number of chunks embedded per Ollama batch request. |
+| `RAG_UPSERT_BATCH_SIZE` | `5000` | Maximum number of chunk records sent to Chroma in each upsert request during ingestion. |
+| `DEVOPS_TICKET_MAX_RECORD_CHARS` | `5000` | For DevOps ticket JSON imports, keep each ticket as one record unless it exceeds this size; larger tickets are split only within that ticket. |
 
 ---
 
 ## Usage Tips
 
-- **Session Document**: Click `PDF` to attach a PDF or DOCX document only to the current chat thread.
-- **Permanent Knowledge Base**: Click `Library` to ingest a PDF or DOCX document into the selected knowledge base. That data stays in Chroma until you remove/reset it outside the app.
+- **Session Document**: Click `PDF` to attach a PDF, DOCX, or JSON document only to the current chat thread.
+- **Permanent Knowledge Base**: Click `Library` to ingest a PDF, DOCX, or JSON document into the selected knowledge base. That data stays in Chroma until you remove/reset it outside the app.
+- **DevOps Ticket JSON**: JSON exports with `ticketNumber`, `searchText`, and `searchChunks` are ingested per ticket instead of as one raw JSON blob, so comments stay with the correct ticket.
 - **Delete from KB**: Open `Browse` next to the knowledge base selector to inspect indexed files, run a connection test, or delete a document from the selected knowledge base.
 - **KB Search**: Toggle `KB` on when you want the model to retrieve from the selected knowledge base for the current prompt.
+
+### Ticket Query Behavior
+
+- **Exact ticket lookup**: Prompts that contain an explicit ticket number such as `summarize ticket 5000` bypass embedding search and use a direct metadata lookup on `ticketNumber` first. This is both faster and more reliable than broad vector retrieval for exact-ID requests.
+- **Exact ticket answer constraints**: When an explicit ticket number is found, the system prompt tells the model that the requested ticket was resolved exactly and that it must answer from that ticket's retrieved excerpts only.
+- **Latest related ticket lookup**: Prompts such as `what is the latest ticket related to monthend report?` first prefer title and ticket-description relevance to the topic, then choose the newest ticket by `createdDate` among those relevant matches.
+- **Created date rule**: For DevOps ticket JSON, `createdDate` is the ticket creation timestamp. Comment dates are not used to decide the latest ticket.
 
 ### Multiple Vector Instances
 

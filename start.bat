@@ -17,11 +17,13 @@ if %errorlevel% neq 0 (
 )
 
 set "APP_PORT=3001"
+set "OLLAMA_BASE_URL=http://localhost:11434"
 set "CHROMA_HOST=127.0.0.1"
 set "CHROMA_PORT=8000"
 
 for /f "usebackq tokens=1,* delims==" %%A in (".env") do (
   if /I "%%~A"=="PORT" set "APP_PORT=%%~B"
+  if /I "%%~A"=="OLLAMA_BASE_URL" set "OLLAMA_BASE_URL=%%~B"
   if /I "%%~A"=="CHROMA_HOST" set "CHROMA_HOST=%%~B"
   if /I "%%~A"=="CHROMA_PORT" set "CHROMA_PORT=%%~B"
 )
@@ -78,6 +80,35 @@ if defined CHROMA_READY (
   echo Chroma started successfully.
 ) else (
   echo [WARNING] Chroma did not respond on http://%CHROMA_HOST%:%CHROMA_PORT%.
+)
+
+:check_ollama
+echo Checking Ollama at %OLLAMA_BASE_URL%/api/tags ...
+powershell -NoProfile -Command ^
+  "try { $r = Invoke-WebRequest -UseBasicParsing -Uri '%OLLAMA_BASE_URL%/api/tags' -TimeoutSec 2; exit 0 } catch { exit 1 }"
+
+if %errorlevel% neq 0 (
+  echo Ollama is not responding. Waiting for it to become ready...
+  set "OLLAMA_READY="
+  for /l %%I in (1,1,20) do (
+    timeout /t 1 /nobreak >nul
+    powershell -NoProfile -Command ^
+      "try { $r = Invoke-WebRequest -UseBasicParsing -Uri '%OLLAMA_BASE_URL%/api/tags' -TimeoutSec 2; exit 0 } catch { exit 1 }"
+    if !errorlevel! equ 0 (
+      set "OLLAMA_READY=1"
+      goto :ollama_checked
+    )
+  )
+) else (
+  set "OLLAMA_READY=1"
+)
+
+:ollama_checked
+if defined OLLAMA_READY (
+  echo Ollama is ready.
+) else (
+  echo [WARNING] Ollama did not respond on %OLLAMA_BASE_URL%.
+  echo The app will still open, but model loading and chat may fail until Ollama is available.
 )
 
 :check_app_port

@@ -10,3 +10,6 @@ dist/
 coverage/
 *.traineddata
 chroma-data/
+.playwright-mcp/page-2026-04-03T01-42-40-593Z.yml
+.playwright-mcp/page-2026-04-03T01-43-31-842Z.yml
+azure-workitem-comments-3000-3100.json

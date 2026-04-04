@@ -22,8 +22,14 @@
         <div class="controls">
           <label for="model">Model</label>
           <select id="model" name="model"></select>
-          <label for="vector-instance">Knowledge Base</label>
+          <label for="vector-instance">KB</label>
           <select id="vector-instance" name="vector-instance"></select>
+          <label for="source-filter">Source</label>
+          <select id="source-filter" name="source-filter">
+            <option value="all">All</option>
+            <option value="reference_doc">Docs</option>
+            <option value="ticket_json">Tickets</option>
+          </select>
           <button id="vector-library-btn" type="button" class="header-mini-btn" aria-label="Open knowledge base browser">
             Browse
           </button>
@@ -81,7 +87,7 @@
                       </svg>
                       <span>PDF</span>
                     </button>
-                    <button id="library-btn" class="icon-btn tool-icon-btn" type="button" aria-label="Add PDF to library">
+                    <button id="library-btn" class="icon-btn tool-icon-btn" type="button" aria-label="Add document to library">
                       <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
                         <path
                           d="M5 4.5A2.5 2.5 0 0 1 7.5 2H19v17.5a2.5 2.5 0 0 0-2.5-2.5H5zm0 0V18a2 2 0 0 0 2 2h9.5"
@@ -116,10 +122,10 @@
                     </button>
                   </div>
                 </div>
-                <p class="composer-hint">PDF or DOCX stays in the current chat. Library adds a document permanently to the selected knowledge base. Enter to send.</p>
+                <p class="composer-hint">PDF, DOCX, or JSON stays in the current chat. Library adds a document permanently to the selected knowledge base. Enter to send.</p>
               </div>
-              <input id="pdf-file" name="pdf-file" type="file" accept="application/pdf,.pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,.docx" hidden />
-              <input id="library-file" name="library-file" type="file" accept="application/pdf,.pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,.docx" hidden />
+              <input id="pdf-file" name="pdf-file" type="file" accept="application/pdf,.pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,.docx,application/json,text/json,.json" hidden />
+              <input id="library-file" name="library-file" type="file" accept="application/pdf,.pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,.docx,application/json,text/json,.json" hidden />
               <div id="attached-files" class="attached-files" aria-live="polite"></div>
               <div class="composer-row">
                 <textarea
