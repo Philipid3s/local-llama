@@ -166,6 +166,43 @@ function describeUpstreamFetchError(error, serviceName) {
   return rawMessage || `${serviceName} request failed.`;
 }
 
+function describeOllamaModelError(errorLike) {
+  const rawMessage = String(
+    typeof errorLike === "string"
+      ? errorLike
+      : errorLike?.error || errorLike?.message || errorLike?.raw || ""
+  ).trim();
+  const normalized = rawMessage.toLowerCase();
+
+  if (!rawMessage) {
+    return {
+      userMessage: "Ollama failed while generating the response.",
+      rawMessage: ""
+    };
+  }
+
+  if (normalized.includes("cuda error") || normalized.includes("0xc0000005")) {
+    return {
+      userMessage:
+        "Ollama failed while running the model on the GPU. This usually means the model process crashed or hit GPU memory or context pressure. Try retrying, reducing retrieved context, or restarting Ollama.",
+      rawMessage
+    };
+  }
+
+  if (normalized.includes("out of memory") || normalized.includes("cuda out of memory")) {
+    return {
+      userMessage:
+        "Ollama ran out of GPU memory while generating the response. Reduce the prompt load or restart Ollama before retrying.",
+      rawMessage
+    };
+  }
+
+  return {
+    userMessage: rawMessage,
+    rawMessage
+  };
+}
+
 async function fetchWithTimeout(url, options = {}, timeoutMs = 10_000) {
   const abortController = new AbortController();
   const timeoutHandle = setTimeout(() => abortController.abort(new Error("timeout")), timeoutMs);
@@ -242,6 +279,49 @@ function filterRowsBySource(rows, sourceFilter) {
   const normalizedFilter = normalizeSourceFilter(sourceFilter);
   if (normalizedFilter === "all") return rows;
   return rows.filter((row) => getRowSourceKind(row) === normalizedFilter);
+}
+
+function isDocLogicQuery(query) {
+  const normalized = String(query || "").trim().toLowerCase();
+  if (!normalized) return false;
+  return (
+    /\blogic\b|\bcalculation\b|\bcalculate\b|\bmethodology\b|\bformula\b|\bdeal formulas?\b|\bcustom pricing formula\b|\bcustom deal formula\b|\blinked components?\b|\bhow does\b|\bhow is\b/.test(normalized) ||
+    /\bgreek\b|\bpnl\b/.test(normalized)
+  );
+}
+
+function isDocReferenceQuery(query) {
+  const normalized = String(query || "").trim().toLowerCase();
+  if (!normalized) return false;
+  return /\binstall\b|\binstallation\b|\bsetup\b|\bset up\b|\benvironment\b|\bconfigure\b|\bconfiguration\b|\biis\b|\bupgrade\b|\brollback\b|\brefresh\b|\bpre prod\b|\bpre-prod\b|\badmin manual\b|\bweb services?\b/.test(normalized);
+}
+
+function isTicketAnalysisQuery(query) {
+  const normalized = String(query || "").trim().toLowerCase();
+  if (!normalized) return false;
+  if (extractExplicitTicketNumber(normalized)) return true;
+  if (/\broot cause\b|\broot causes\b|\bcommon issues\b|\bmost common issues\b/.test(normalized)) return true;
+  if (/\blatest\b|\bmost recent\b|\bnewest\b|\bsummar(?:y|ize|ise)\b/.test(normalized)) return true;
+  if (/\bwhat tickets?\b|\bwhich tickets?\b|\btickets? say about\b/.test(normalized)) return true;
+  if (/\bbilling statement\b|\bdeal corruption\b|\bctp\b|\bctpr\b|\bdsr\b|\bmonthend\b|\bmonth end\b/.test(normalized)) return true;
+  if (/\bwhat do you know about\b/.test(normalized) && /\breport\b|\bbilling statement\b|\bdeal corruption\b|\bctp\b|\bdsr\b/.test(normalized)) {
+    return true;
+  }
+  return false;
+}
+
+function resolveEffectiveSourceFilter(query, sourceFilter) {
+  const normalizedFilter = normalizeSourceFilter(sourceFilter);
+  if (normalizedFilter !== "all") {
+    return normalizedFilter;
+  }
+  if ((isDocLogicQuery(query) || isDocReferenceQuery(query)) && !isTicketAnalysisQuery(query)) {
+    return "reference_doc";
+  }
+  if (isTicketAnalysisQuery(query)) {
+    return "ticket_json";
+  }
+  return "all";
 }
 
 function getDocumentType({ filename, mimeType }) {
@@ -934,23 +1014,76 @@ function extractQueryPhrases(value) {
 }
 
 const LATEST_TICKET_QUERY_NOISE_TERMS = new Set([
+  "all",
+  "any",
+  "around",
+  "common",
+  "concerning",
+  "could",
+  "created",
+  "creator",
+  "describe",
+  "details",
+  "explain",
+  "give",
+  "history",
+  "last",
   "latest",
+  "main",
+  "most",
   "newest",
+  "person",
+  "problem",
+  "problems",
   "recent",
+  "regarding",
+  "show",
+  "summaries",
+  "summarize",
+  "summary",
+  "tell",
   "ticket",
   "tickets",
   "issue",
   "issues",
   "related",
   "relation",
-  "reporting"
+  "with",
+  "reporting",
+  "report",
+  "reports"
 ]);
 
+function normalizeTopicSearchText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/\bmonth\s+end\b/g, "monthend")
+    .replace(/\bcommodity\s+trading\s+position\b/g, "ctp")
+    .replace(/\bcredit\s+trading\s+position\b/g, "ctp")
+    .replace(/\bday\s+sales\s+report\b/g, "dsr");
+}
+
 function extractLatestTicketTopicQuery(query) {
-  const tokens = tokenizeForRagSearch(query)
+  const tokens = tokenizeForRagSearch(normalizeTopicSearchText(query))
     .filter((token) => !LATEST_TICKET_QUERY_NOISE_TERMS.has(token));
   return tokens.join(" ").trim();
 }
+
+function detectReportFamilies(text) {
+  const normalized = normalizeTopicSearchText(text);
+  const families = new Set();
+
+  if (/\bmonthend\b/.test(normalized)) families.add("monthend");
+  if (/\bctp\b/.test(normalized)) families.add("ctp");
+  if (/\bdsr\b/.test(normalized)) families.add("dsr");
+  if (/\bbilling\b|\bstatement\b/.test(normalized)) families.add("billing_statement");
+  if (/\bcredit\b/.test(normalized)) families.add("credit");
+  if ((/\bfx\b/.test(normalized) && /\brisk\b/.test(normalized)) || /\bfx\s*risk\b/.test(normalized)) families.add("fx_risk");
+
+  return families;
+}
+
+const PRIMARY_REPORT_FAMILIES = new Set(["monthend", "ctp", "dsr", "billing_statement", "fx_risk"]);
 
 function extractTicketDescriptionText(document) {
   const text = normalizeWhitespace(document);
@@ -962,37 +1095,92 @@ function extractTicketDescriptionText(document) {
   return text;
 }
 
+function splitTicketDescriptionSections(document) {
+  const description = extractTicketDescriptionText(document);
+  if (!description) {
+    return {
+      mainDescription: "",
+      referencedTicketList: ""
+    };
+  }
+
+  const listMarkerMatch = description.match(/\bTicket\s+Priority\s+Title\b/i);
+  if (!listMarkerMatch || listMarkerMatch.index === undefined) {
+    return {
+      mainDescription: description,
+      referencedTicketList: ""
+    };
+  }
+
+  const markerIndex = listMarkerMatch.index;
+  return {
+    mainDescription: normalizeWhitespace(description.slice(0, markerIndex)),
+    referencedTicketList: normalizeWhitespace(description.slice(markerIndex))
+  };
+}
+
 function scoreLatestTicketTopicMatch(query, row) {
   const topicQuery = extractLatestTicketTopicQuery(query);
   if (!topicQuery) {
     return {
       score: 0,
+      directScore: 0,
+      mixedFamilyPenalty: 0,
       titleMatches: 0,
       descriptionMatches: 0,
-      phraseMatches: 0
+      phraseMatches: 0,
+      referenceListMatches: 0,
+      exactTitleMatch: false,
+      exactDescriptionMatch: false
     };
   }
 
   const topicTerms = [...new Set(tokenizeForRagSearch(topicQuery))];
   const topicPhrases = extractQueryPhrases(topicQuery);
-  const title = String(row.metadata?.title || "").toLowerCase();
-  const description = extractTicketDescriptionText(row.document || "").toLowerCase();
+  const queryFamilies = detectReportFamilies(topicQuery);
+  const title = normalizeTopicSearchText(row.metadata?.title || "");
+  const descriptionSections = splitTicketDescriptionSections(row.document || "");
+  const mainDescription = normalizeTopicSearchText(descriptionSections.mainDescription);
+  const referencedTicketList = normalizeTopicSearchText(descriptionSections.referencedTicketList);
   const exactTitleMatch = topicQuery.length >= 4 && title.includes(topicQuery);
-  const exactDescriptionMatch = topicQuery.length >= 4 && description.includes(topicQuery);
+  const exactDescriptionMatch = topicQuery.length >= 4 && mainDescription.includes(topicQuery);
+  const exactReferenceListMatch = topicQuery.length >= 4 && referencedTicketList.includes(topicQuery);
   const titleMatches = topicTerms.filter((term) => title.includes(term)).length;
-  const descriptionMatches = topicTerms.filter((term) => description.includes(term)).length;
-  const phraseMatches = topicPhrases.filter((phrase) => title.includes(phrase) || description.includes(phrase)).length;
+  const descriptionMatches = topicTerms.filter((term) => mainDescription.includes(term)).length;
+  const referenceListMatches = topicTerms.filter((term) => referencedTicketList.includes(term)).length;
+  const phraseMatches = topicPhrases.filter((phrase) => title.includes(phrase) || mainDescription.includes(phrase)).length;
+  const referenceListPhraseMatches = topicPhrases.filter((phrase) => referencedTicketList.includes(phrase)).length;
+  const rowFamilies = detectReportFamilies(`${title}\n${mainDescription}`);
+  const primaryQueryFamilies = new Set([...queryFamilies].filter((family) => PRIMARY_REPORT_FAMILIES.has(family)));
+  const primaryRowFamilies = new Set([...rowFamilies].filter((family) => PRIMARY_REPORT_FAMILIES.has(family)));
+  const mixedFamilyPenalty =
+    primaryQueryFamilies.size === 1 &&
+    [...primaryQueryFamilies].every((family) => primaryRowFamilies.has(family)) &&
+    primaryRowFamilies.size > 1
+      ? Math.min(4, (primaryRowFamilies.size - primaryQueryFamilies.size) * 2)
+      : 0;
+  const directScore =
+    (exactTitleMatch ? 10 : 0) +
+    (exactDescriptionMatch ? 6 : 0) +
+    (titleMatches * 5) +
+    (descriptionMatches * 3) +
+    (phraseMatches * 6) -
+    mixedFamilyPenalty;
 
   return {
     score:
-      (exactTitleMatch ? 10 : 0) +
-      (exactDescriptionMatch ? 6 : 0) +
-      (titleMatches * 5) +
-      (descriptionMatches * 3) +
-      (phraseMatches * 6),
+      directScore +
+      (exactReferenceListMatch ? 1 : 0) +
+      referenceListMatches +
+      referenceListPhraseMatches,
+    directScore,
+    mixedFamilyPenalty,
     titleMatches,
     descriptionMatches,
-    phraseMatches
+    phraseMatches,
+    referenceListMatches,
+    exactTitleMatch,
+    exactDescriptionMatch
   };
 }
 
@@ -1002,6 +1190,9 @@ function hasSummaryLanguage(query) {
 
   const summaryPatterns = [
     /^what do you know about\b/,
+    /^what do tickets say about\b/,
+    /^what tickets are about\b/,
+    /^which tickets are about\b/,
     /^tell me about\b/,
     /^summari[sz]e\b/,
     /\boverview\b/,
@@ -1061,7 +1252,7 @@ function isTicketFocusedQuery(query) {
 }
 
 function isLatestTicketQuery(query) {
-  return /\blatest\b|\bmost recent\b|\bnewest\b|\blast ticket\b|\blast issue\b|\brecent ticket\b|\brecent issue\b/i.test(String(query || ""));
+  return /\blatest\b|\bmost recent\b|\bnewest\b|\blast ticket\b|\blast issue\b|\brecent ticket\b|\brecent issue\b|\blast person\b.*\bcreated\b.*\bticket\b|\bwho\s+created\s+(?:the\s+)?(?:latest|last|most recent|newest)\b/i.test(String(query || ""));
 }
 
 function extractExplicitTicketNumber(query) {
@@ -1258,6 +1449,97 @@ async function findExactTicketNumberMatches(collection, ticketNumber, sourceFilt
     });
 }
 
+async function findLatestTicketTopicRows(collection, query, sourceFilter = "all", mode = "single") {
+  const collectionCount = await collection.count();
+  if (!collectionCount) {
+    return [];
+  }
+
+  const result = await collection.get({
+    limit: collectionCount,
+    include: ["documents", "metadatas"]
+  });
+
+  const ticketRows = filterRowsBySource(result.rows(), sourceFilter)
+    .filter((row) => row.metadata?.ticketNumber && row.metadata?.documentKind === "devops-ticket");
+
+  if (!ticketRows.length) {
+    return [];
+  }
+
+  const groups = new Map();
+  for (const row of ticketRows) {
+    const ticketNumber = String(row.metadata.ticketNumber);
+    const topic = scoreLatestTicketTopicMatch(query, row);
+    if (!groups.has(ticketNumber)) {
+      groups.set(ticketNumber, {
+        ticketNumber,
+        rows: [],
+        createdTimestamp: row.metadata?.createdDate ? Date.parse(row.metadata.createdDate) : Number.NaN,
+        bestTopicScore: Number.NEGATIVE_INFINITY,
+        bestDirectTopicScore: Number.NEGATIVE_INFINITY,
+        bestRow: row,
+        bestRowChunkIndex: Number(row.metadata?.chunkIndex) || 1
+      });
+    }
+
+    const group = groups.get(ticketNumber);
+    const chunkIndex = Number(row.metadata?.chunkIndex) || 1;
+    group.rows.push(row);
+    if (Number.isFinite(row.metadata?.createdDate ? Date.parse(row.metadata.createdDate) : Number.NaN)) {
+      group.createdTimestamp = row.metadata?.createdDate ? Date.parse(row.metadata.createdDate) : group.createdTimestamp;
+    }
+    if (
+      topic.directScore > group.bestDirectTopicScore ||
+      (topic.directScore === group.bestDirectTopicScore && topic.score > group.bestTopicScore) ||
+      (topic.directScore === group.bestDirectTopicScore && topic.score === group.bestTopicScore && chunkIndex < group.bestRowChunkIndex)
+    ) {
+      group.bestDirectTopicScore = topic.directScore;
+      group.bestTopicScore = topic.score;
+      group.bestRow = row;
+      group.bestRowChunkIndex = chunkIndex;
+    }
+  }
+
+  const rankedGroups = [...groups.values()];
+  const bestDirectTopicScore = Math.max(...rankedGroups.map((group) => group.bestDirectTopicScore || 0));
+  const bestTopicScore = Math.max(...rankedGroups.map((group) => group.bestTopicScore || 0));
+  const directTopicFloor = bestDirectTopicScore > 0 ? Math.max(3, bestDirectTopicScore * 0.45) : 0;
+  const topicFloor = bestTopicScore > 0 ? Math.max(3, bestTopicScore * 0.45) : 0;
+
+  const directGroups = rankedGroups.filter((group) => (group.bestDirectTopicScore || 0) >= directTopicFloor);
+  const topicalGroups = rankedGroups.filter((group) => (group.bestTopicScore || 0) >= topicFloor);
+  const candidateGroups = directGroups.length ? directGroups : topicalGroups;
+
+  if (!candidateGroups.length) {
+    return [];
+  }
+
+  const sortedGroups = candidateGroups.sort((left, right) => {
+    const leftTs = Number.isFinite(left.createdTimestamp) ? left.createdTimestamp : Number.NEGATIVE_INFINITY;
+    const rightTs = Number.isFinite(right.createdTimestamp) ? right.createdTimestamp : Number.NEGATIVE_INFINITY;
+    if (rightTs !== leftTs) return rightTs - leftTs;
+    if ((right.bestDirectTopicScore || 0) !== (left.bestDirectTopicScore || 0)) {
+      return (right.bestDirectTopicScore || 0) - (left.bestDirectTopicScore || 0);
+    }
+    if ((right.bestTopicScore || 0) !== (left.bestTopicScore || 0)) {
+      return (right.bestTopicScore || 0) - (left.bestTopicScore || 0);
+    }
+    return left.ticketNumber.localeCompare(right.ticketNumber);
+  });
+
+  if (mode === "recent_summary") {
+    return sortedGroups
+      .slice(0, RAG_RECENT_SUMMARY_TICKET_LIMIT)
+      .map((group) => group.bestRow);
+  }
+
+  const winner = sortedGroups[0];
+  return winner.rows
+    .sort((left, right) => (Number(left.metadata?.chunkIndex) || 1) - (Number(right.metadata?.chunkIndex) || 1))
+    .slice(0, RAG_RETRIEVAL_LIMIT);
+}
+
 function selectBroadTopicRows(query, rows) {
   const queryText = String(query || "").trim().toLowerCase();
   const queryTerms = [...new Set(tokenizeForRagSearch(queryText))];
@@ -1272,17 +1554,40 @@ function selectBroadTopicRows(query, rows) {
     }
   }
 
-  return [...grouped.values()]
+  const rankedRows = [...grouped.values()]
+    .map((item) => {
+      const topic = scoreLatestTicketTopicMatch(queryText, item.row);
+      return {
+        ...item,
+        directTopicScore: topic.directScore || 0,
+        topicScore: topic.score || 0
+      };
+    })
     .sort((left, right) => {
-      if (right.score !== left.score) return right.score - left.score;
+      if ((right.directTopicScore || 0) !== (left.directTopicScore || 0)) {
+        return (right.directTopicScore || 0) - (left.directTopicScore || 0);
+      }
+      if ((right.topicScore || 0) !== (left.topicScore || 0)) {
+        return (right.topicScore || 0) - (left.topicScore || 0);
+      }
       const leftTs = Number.isFinite(left.createdTimestamp) ? left.createdTimestamp : Number.NEGATIVE_INFINITY;
       const rightTs = Number.isFinite(right.createdTimestamp) ? right.createdTimestamp : Number.NEGATIVE_INFINITY;
       if (rightTs !== leftTs) return rightTs - leftTs;
+      if (right.score !== left.score) return right.score - left.score;
       const leftDistance = typeof left.row.distance === "number" ? left.row.distance : Number.POSITIVE_INFINITY;
       const rightDistance = typeof right.row.distance === "number" ? right.row.distance : Number.POSITIVE_INFINITY;
       if (leftDistance !== rightDistance) return leftDistance - rightDistance;
       return left.index - right.index;
-    })
+    });
+
+  const strongestDirectTopic = Math.max(...rankedRows.map((item) => item.directTopicScore || 0), 0);
+  const topicalRows = rankedRows.filter((item) => (item.directTopicScore || 0) > 0 || (item.topicScore || 0) > 0);
+  const directRows = rankedRows.filter((item) =>
+    strongestDirectTopic > 0 &&
+    (item.directTopicScore || 0) >= Math.max(3, strongestDirectTopic * 0.45)
+  );
+
+  return (directRows.length ? directRows : (topicalRows.length ? topicalRows : rankedRows))
     .slice(0, RAG_BROAD_TOPIC_TICKET_LIMIT)
     .map((item) => item.row);
 }
@@ -1290,6 +1595,7 @@ function selectBroadTopicRows(query, rows) {
 function selectRecentSummaryRows(query, rows) {
   const queryText = String(query || "").trim().toLowerCase();
   const queryTerms = [...new Set(tokenizeForRagSearch(queryText))];
+  const latestFocused = isLatestTicketQuery(queryText);
   const grouped = new Map();
 
   for (const [index, row] of rows.entries()) {
@@ -1303,7 +1609,24 @@ function selectRecentSummaryRows(query, rows) {
 
   const groupedRows = [...grouped.values()]
     .filter((item) => item.row.metadata?.ticketNumber)
+    .map((item) => {
+      const topicScore = scoreLatestTicketTopicMatch(queryText, item.row);
+      return {
+        ...item,
+        topicScore: topicScore.score,
+        directTopicScore: topicScore.directScore,
+        topicTitleMatches: topicScore.titleMatches,
+        topicDescriptionMatches: topicScore.descriptionMatches,
+        topicPhraseMatches: topicScore.phraseMatches
+      };
+    })
     .sort((left, right) => {
+      if (latestFocused && (right.directTopicScore || 0) !== (left.directTopicScore || 0)) {
+        return (right.directTopicScore || 0) - (left.directTopicScore || 0);
+      }
+      if (latestFocused && (right.topicScore || 0) !== (left.topicScore || 0)) {
+        return (right.topicScore || 0) - (left.topicScore || 0);
+      }
       if (right.score !== left.score) return right.score - left.score;
       const leftTs = Number.isFinite(left.createdTimestamp) ? left.createdTimestamp : Number.NEGATIVE_INFINITY;
       const rightTs = Number.isFinite(right.createdTimestamp) ? right.createdTimestamp : Number.NEGATIVE_INFINITY;
@@ -1320,10 +1643,22 @@ function selectRecentSummaryRows(query, rows) {
 
   const bestScore = groupedRows[0].score;
   const relevanceFloor = Math.max(6, bestScore * 0.55);
-  const relevantRows = groupedRows.filter((item) =>
-    item.score >= relevanceFloor &&
-    (item.lexicalMatches > 0 || item.titleMatches > 0 || item.phraseMatches > 0)
+  const bestDirectTopicScore = Math.max(...groupedRows.map((item) => item.directTopicScore || 0));
+  const directTopicFloor = bestDirectTopicScore > 0 ? Math.max(3, bestDirectTopicScore * 0.45) : 0;
+  const topicalRows = groupedRows.filter((item) => (item.directTopicScore || 0) > 0 || (item.topicScore || 0) > 0);
+  const directTopicRows = groupedRows.filter((item) =>
+    bestDirectTopicScore > 0 &&
+    (item.directTopicScore || 0) >= directTopicFloor &&
+    ((item.topicTitleMatches || 0) > 0 || (item.topicDescriptionMatches || 0) > 0 || (item.topicPhraseMatches || 0) > 0)
   );
+  const relevantRows = directTopicRows.length
+    ? directTopicRows
+    : (topicalRows.length
+      ? topicalRows
+      : groupedRows.filter((item) =>
+        item.score >= relevanceFloor &&
+        (item.lexicalMatches > 0 || item.titleMatches > 0 || item.phraseMatches > 0)
+      ));
 
   const bestRecentTimestamp = relevantRows.find((item) => Number.isFinite(item.createdTimestamp))?.createdTimestamp ?? Number.NaN;
   const recentFloor = Number.isFinite(bestRecentTimestamp)
@@ -1341,6 +1676,12 @@ function selectRecentSummaryRows(query, rows) {
       const leftTs = Number.isFinite(left.createdTimestamp) ? left.createdTimestamp : Number.NEGATIVE_INFINITY;
       const rightTs = Number.isFinite(right.createdTimestamp) ? right.createdTimestamp : Number.NEGATIVE_INFINITY;
       if (rightTs !== leftTs) return rightTs - leftTs;
+      if ((right.directTopicScore || 0) !== (left.directTopicScore || 0)) {
+        return (right.directTopicScore || 0) - (left.directTopicScore || 0);
+      }
+      if ((right.topicScore || 0) !== (left.topicScore || 0)) {
+        return (right.topicScore || 0) - (left.topicScore || 0);
+      }
       if (right.score !== left.score) return right.score - left.score;
       return left.index - right.index;
     })
@@ -1396,6 +1737,7 @@ function resolveTicketRows(query, scoredRows) {
         rows: sortedRows,
         relevance: group.bestScore + (group.aggregateScore * 0.15) + (group.maxLexicalMatches * 2) + (group.maxTitleMatches * 3),
         topicScore: Math.max(...topicScores.map((score) => score.score)),
+        directTopicScore: Math.max(...topicScores.map((score) => score.directScore || 0)),
         topicTitleMatches: Math.max(...topicScores.map((score) => score.titleMatches)),
         topicDescriptionMatches: Math.max(...topicScores.map((score) => score.descriptionMatches)),
         topicPhraseMatches: Math.max(...topicScores.map((score) => score.phraseMatches))
@@ -1410,8 +1752,15 @@ function resolveTicketRows(query, scoredRows) {
     });
 
   if (latestFocused) {
+    const bestDirectTopicScore = Math.max(...rankedGroups.map((group) => group.directTopicScore || 0));
+    const directTopicFloor = bestDirectTopicScore > 0 ? Math.max(3, bestDirectTopicScore * 0.45) : 0;
+    const directTopicalGroups = rankedGroups.filter((group) =>
+      bestDirectTopicScore > 0 &&
+      (group.directTopicScore || 0) >= directTopicFloor &&
+      (group.topicTitleMatches > 0 || group.topicDescriptionMatches > 0 || group.topicPhraseMatches > 0)
+    );
     const bestTopicScore = Math.max(...rankedGroups.map((group) => group.topicScore || 0));
-    const topicFloor = bestTopicScore > 0 ? Math.max(3, bestTopicScore * 0.6) : 0;
+    const topicFloor = bestTopicScore > 0 ? Math.max(3, bestTopicScore * 0.45) : 0;
     const topicalGroups = rankedGroups.filter((group) =>
       bestTopicScore > 0 &&
       group.topicScore >= topicFloor &&
@@ -1422,12 +1771,17 @@ function resolveTicketRows(query, scoredRows) {
       group.relevance >= relevanceFloor &&
       (group.maxLexicalMatches > 0 || group.maxTitleMatches > 0)
     );
-    const candidateGroups = topicalGroups.length ? topicalGroups : (fallbackGroups.length ? fallbackGroups : [rankedGroups[0]]);
+    const candidateGroups = directTopicalGroups.length
+      ? directTopicalGroups
+      : (topicalGroups.length ? topicalGroups : (fallbackGroups.length ? fallbackGroups : [rankedGroups[0]]));
     const winner = candidateGroups
       .sort((left, right) => {
         const leftTs = Number.isFinite(left.createdTimestamp) ? left.createdTimestamp : Number.NEGATIVE_INFINITY;
         const rightTs = Number.isFinite(right.createdTimestamp) ? right.createdTimestamp : Number.NEGATIVE_INFINITY;
         if (rightTs !== leftTs) return rightTs - leftTs;
+        if ((right.directTopicScore || 0) !== (left.directTopicScore || 0)) {
+          return (right.directTopicScore || 0) - (left.directTopicScore || 0);
+        }
         if ((right.topicScore || 0) !== (left.topicScore || 0)) {
           return (right.topicScore || 0) - (left.topicScore || 0);
         }
@@ -1483,7 +1837,7 @@ function buildResolvedTicketSummary(query, rows) {
         `- sourceLabel: [source: ${metadata.filename || "document"} ticket ${metadata.ticketNumber} chunk ${metadata.chunkIndex || 1}]`
       ];
   if (!explicitTicketNumber && isLatestTicketQuery(query)) {
-    lines.push("- resolutionRule: selected from matched DevOps tickets by full-text relevance first, then newest ticket createdDate");
+    lines.push("- resolutionRule: selected from topic-relevant DevOps tickets by newest ticket createdDate first, then topic relevance as tie-breaker");
   }
   return lines.join("\n");
 }
@@ -1691,16 +2045,16 @@ async function testVectorInstance(instanceId) {
   return summary;
 }
 
-async function maybeAugmentMessagesWithDocumentContext(messages, vectorSearchEnabled, vectorInstanceId, sourceFilter = "all") {
-  if (!vectorSearchEnabled) {
-    return messages;
+async function retrieveRagRowsForQuery(query, vectorInstanceId, sourceFilter = "all") {
+  const normalizedQuery = String(query || "").trim();
+  if (!normalizedQuery) {
+    return {
+      ok: false,
+      reason: "missing_query",
+      rows: []
+    };
   }
-
-  const query = getLatestUserMessage(messages);
-  if (!query) {
-    return messages;
-  }
-  const normalizedSourceFilter = normalizeSourceFilter(sourceFilter);
+  const normalizedSourceFilter = resolveEffectiveSourceFilter(query, sourceFilter);
   const queryMode = resolveRagQueryMode(query);
   const broadTopicQuery = queryMode === "summary";
   const recentSummaryQuery = queryMode === "summary_recent";
@@ -1709,13 +2063,14 @@ async function maybeAugmentMessagesWithDocumentContext(messages, vectorSearchEna
   const instance = getVectorInstanceConfig(vectorInstanceId);
   const collection = await getExistingRagCollection(instance.id);
   if (!collection) {
-    return [
-      {
-        role: "system",
-        content: `Knowledge base "${instance.name}" is empty. Say clearly that no indexed documents are available yet.`
-      },
-      ...messages
-    ];
+    return {
+      ok: false,
+      reason: "empty_collection",
+      instance,
+      queryMode,
+      sourceFilter: normalizedSourceFilter,
+      rows: []
+    };
   }
 
   if (explicitTicketNumber && queryMode === "precise") {
@@ -1723,25 +2078,44 @@ async function maybeAugmentMessagesWithDocumentContext(messages, vectorSearchEna
       .slice(0, RAG_RETRIEVAL_LIMIT);
 
     if (rows.length === 0) {
-      return [
-        {
-          role: "system",
-          content:
-            `Knowledge base "${instance.name}" does not contain ticket ${explicitTicketNumber} in the indexed material. Say clearly that ticket ${explicitTicketNumber} was not found in the knowledge base.`
-        },
-        ...messages
-      ];
+      return {
+        ok: false,
+        reason: "exact_ticket_not_found",
+        instance,
+        queryMode,
+        sourceFilter: normalizedSourceFilter,
+        explicitTicketNumber,
+        rows: []
+      };
     }
 
-    logRetrievedRagRows(query, instance.name, queryMode, rows);
+    return {
+      ok: true,
+      instance,
+      queryMode,
+      sourceFilter: normalizedSourceFilter,
+      explicitTicketNumber,
+      rows
+    };
+  }
 
-    return [
-      {
-        role: "system",
-        content: buildRagContextMessage(query, rows, instance.name)
-      },
-      ...messages
-    ];
+  if (normalizedSourceFilter === "ticket_json" && isLatestTicketQuery(query) && !explicitTicketNumber) {
+    const rows = await findLatestTicketTopicRows(
+      collection,
+      query,
+      normalizedSourceFilter,
+      recentSummaryQuery ? "recent_summary" : "single"
+    );
+    if (rows.length > 0) {
+      return {
+        ok: true,
+        instance,
+        queryMode,
+        sourceFilter: normalizedSourceFilter,
+        explicitTicketNumber,
+        rows
+      };
+    }
   }
 
   const queryEmbeddings = await embedTexts([query]);
@@ -1764,16 +2138,69 @@ async function maybeAugmentMessagesWithDocumentContext(messages, vectorSearchEna
         : rerankRagRows(query, candidateRows);
   }
   if (rows.length === 0) {
+    return {
+      ok: false,
+      reason: "no_matches",
+      instance,
+      queryMode,
+      sourceFilter: normalizedSourceFilter,
+      rows: []
+    };
+  }
+
+  return {
+    ok: true,
+    instance,
+    queryMode,
+    sourceFilter: normalizedSourceFilter,
+    explicitTicketNumber,
+    rows
+  };
+}
+
+async function maybeAugmentMessagesWithDocumentContext(messages, vectorSearchEnabled, vectorInstanceId, sourceFilter = "all") {
+  if (!vectorSearchEnabled) {
+    return messages;
+  }
+
+  const query = getLatestUserMessage(messages);
+  if (!query) {
+    return messages;
+  }
+  const retrieval = await retrieveRagRowsForQuery(query, vectorInstanceId, sourceFilter);
+  if (!retrieval.ok) {
+    if (retrieval.reason === "empty_collection") {
+      return [
+        {
+          role: "system",
+          content: `Knowledge base "${retrieval.instance.name}" is empty. Say clearly that no indexed documents are available yet.`
+        },
+        ...messages
+      ];
+    }
+    if (retrieval.reason === "exact_ticket_not_found") {
+      return [
+        {
+          role: "system",
+          content:
+            `Knowledge base "${retrieval.instance.name}" does not contain ticket ${retrieval.explicitTicketNumber} in the indexed material. Say clearly that ticket ${retrieval.explicitTicketNumber} was not found in the knowledge base.`
+        },
+        ...messages
+      ];
+    }
     return [
       {
         role: "system",
         content:
-          `Knowledge base "${instance.name}" returned no matching excerpts for the current question. Say clearly if the answer is not in the indexed material.`
+          `Knowledge base "${retrieval.instance?.name || "selected"}" returned no matching excerpts for the current question. Say clearly if the answer is not in the indexed material.`
       },
       ...messages
     ];
   }
 
+  const { instance, queryMode, rows } = retrieval;
+  const broadTopicQuery = queryMode === "summary";
+  const recentSummaryQuery = queryMode === "summary_recent";
   logRetrievedRagRows(query, instance.name, queryMode, rows);
 
   return [
@@ -2267,9 +2694,17 @@ async function handleChatStream(req, res) {
       } catch {
         payload = { raw: text };
       }
+      const modelError = describeOllamaModelError(payload);
+      console.error("Ollama request failed:", {
+        status: ollamaRes.status,
+        rawError: modelError.rawMessage || payload.error || payload.raw || text
+      });
       sendJson(res, ollamaRes.status, {
-        error: payload.error || "Ollama stream request failed",
-        details: payload
+        error: modelError.userMessage || "Ollama stream request failed",
+        details: {
+          ...payload,
+          rawError: modelError.rawMessage || payload.error || payload.raw || text
+        }
       });
       return;
     }
@@ -2310,7 +2745,13 @@ async function handleChatStream(req, res) {
         }
 
         if (parsed.error) {
-          sendSse(res, { type: "error", error: parsed.error });
+          const modelError = describeOllamaModelError(parsed.error);
+          console.error("Ollama stream error:", modelError.rawMessage || parsed.error);
+          sendSse(res, {
+            type: "error",
+            error: modelError.userMessage,
+            details: modelError.rawMessage || parsed.error
+          });
           res.end();
           return;
         }
@@ -2481,78 +2922,97 @@ function serveStatic(req, res, parsedUrl) {
   });
 }
 
-setupFileLogging();
+function createServer() {
+  return http.createServer(async (req, res) => {
+    const parsedUrl = new URL(req.url, `http://${req.headers.host}`);
 
-const server = http.createServer(async (req, res) => {
-  const parsedUrl = new URL(req.url, `http://${req.headers.host}`);
+    if (req.method === "GET" && parsedUrl.pathname === "/api/models") {
+      await handleModels(req, res);
+      return;
+    }
 
-  if (req.method === "GET" && parsedUrl.pathname === "/api/models") {
-    await handleModels(req, res);
-    return;
-  }
+    if (req.method === "GET" && parsedUrl.pathname === "/api/vector/instances") {
+      await handleVectorInstances(req, res);
+      return;
+    }
 
-  if (req.method === "GET" && parsedUrl.pathname === "/api/vector/instances") {
-    await handleVectorInstances(req, res);
-    return;
-  }
+    if (req.method === "GET" && parsedUrl.pathname === "/api/vector/library") {
+      await handleVectorLibrary(req, res, parsedUrl);
+      return;
+    }
 
-  if (req.method === "GET" && parsedUrl.pathname === "/api/vector/library") {
-    await handleVectorLibrary(req, res, parsedUrl);
-    return;
-  }
+    if (req.method === "GET" && parsedUrl.pathname === "/api/vector/test") {
+      await handleVectorTest(req, res, parsedUrl);
+      return;
+    }
 
-  if (req.method === "GET" && parsedUrl.pathname === "/api/vector/test") {
-    await handleVectorTest(req, res, parsedUrl);
-    return;
-  }
+    if (req.method === "POST" && parsedUrl.pathname === "/api/chat") {
+      await handleChat(req, res);
+      return;
+    }
 
-  if (req.method === "POST" && parsedUrl.pathname === "/api/chat") {
-    await handleChat(req, res);
-    return;
-  }
+    if (req.method === "POST" && parsedUrl.pathname === "/api/chat/stream") {
+      await handleChatStream(req, res);
+      return;
+    }
 
-  if (req.method === "POST" && parsedUrl.pathname === "/api/chat/stream") {
-    await handleChatStream(req, res);
-    return;
-  }
+    if (req.method === "POST" && (parsedUrl.pathname === "/api/document/extract" || parsedUrl.pathname === "/api/pdf/extract")) {
+      await handleDocumentExtract(req, res);
+      return;
+    }
 
-  if (req.method === "POST" && (parsedUrl.pathname === "/api/document/extract" || parsedUrl.pathname === "/api/pdf/extract")) {
-    await handleDocumentExtract(req, res);
-    return;
-  }
+    if (req.method === "POST" && parsedUrl.pathname === "/api/rag/ingest") {
+      await handleRagIngest(req, res);
+      return;
+    }
 
-  if (req.method === "POST" && parsedUrl.pathname === "/api/rag/ingest") {
-    await handleRagIngest(req, res);
-    return;
-  }
+    if (req.method === "POST" && parsedUrl.pathname === "/api/vector/delete") {
+      await handleVectorDelete(req, res);
+      return;
+    }
 
-  if (req.method === "POST" && parsedUrl.pathname === "/api/vector/delete") {
-    await handleVectorDelete(req, res);
-    return;
-  }
+    if (req.method === "GET") {
+      serveStatic(req, res, parsedUrl);
+      return;
+    }
 
-  if (req.method === "GET") {
-    serveStatic(req, res, parsedUrl);
-    return;
-  }
+    res.writeHead(405);
+    res.end("Method Not Allowed");
+  });
+}
 
-  res.writeHead(405);
-  res.end("Method Not Allowed");
-});
+function startServer() {
+  setupFileLogging();
+  const server = createServer();
+  server.listen(PORT, HOST, () => {
+    console.log(`Server listening on http://localhost:${PORT}`);
+    console.log(`Proxying Ollama to ${OLLAMA_BASE_URL}`);
+    console.log(
+      `OCR fallback: ${OCR_ENABLED ? `enabled (lang=${OCR_LANG}, maxPages=${OCR_MAX_PAGES})` : "disabled"}`
+    );
+    console.log(
+      `Brave web search: ${
+        BRAVE_SEARCH_ENABLED
+          ? `enabled (country=${BRAVE_SEARCH_COUNTRY}, maxResults=${BRAVE_SEARCH_MAX_RESULTS})`
+          : "disabled"
+      }`
+    );
+    console.log(`RAG embeddings: model=${OLLAMA_EMBED_MODEL}`);
+    console.log(`Vector instances: ${VECTOR_INSTANCES.map((item) => `${item.name}(${item.id})`).join(", ")}`);
+  });
+  return server;
+}
 
-server.listen(PORT, HOST, () => {
-  console.log(`Server listening on http://localhost:${PORT}`);
-  console.log(`Proxying Ollama to ${OLLAMA_BASE_URL}`);
-  console.log(
-    `OCR fallback: ${OCR_ENABLED ? `enabled (lang=${OCR_LANG}, maxPages=${OCR_MAX_PAGES})` : "disabled"}`
-  );
-  console.log(
-    `Brave web search: ${
-      BRAVE_SEARCH_ENABLED
-        ? `enabled (country=${BRAVE_SEARCH_COUNTRY}, maxResults=${BRAVE_SEARCH_MAX_RESULTS})`
-        : "disabled"
-    }`
-  );
-  console.log(`RAG embeddings: model=${OLLAMA_EMBED_MODEL}`);
-  console.log(`Vector instances: ${VECTOR_INSTANCES.map((item) => `${item.name}(${item.id})`).join(", ")}`);
-});
+module.exports = {
+  retrieveRagRowsForQuery,
+  resolveEffectiveSourceFilter,
+  resolveRagQueryMode,
+  getRowSourceKind,
+  startServer,
+  createServer,
+  DEFAULT_VECTOR_INSTANCE_ID
+};
+
+if (require.main === module) {
+  startServer();
+}

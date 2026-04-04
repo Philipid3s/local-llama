@@ -5,6 +5,7 @@
   "description": "bonsAI - local ollama client",
   "scripts": {
     "test": "node --check server.js && node --check public/app.js",
+    "test:rag": "node --env-file-if-exists=.env scripts/rag-eval.js",
     "start": "node --env-file-if-exists=.env server.js"
   },
   "dependencies": {

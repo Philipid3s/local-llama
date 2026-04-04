@@ -197,6 +197,47 @@ Typical usage:
 - **Exact ticket answer constraints**: When an explicit ticket number is found, the system prompt tells the model that the requested ticket was resolved exactly and that it must answer from that ticket's retrieved excerpts only.
 - **Latest related ticket lookup**: Prompts such as `what is the latest ticket related to monthend report?` first prefer title and ticket-description relevance to the topic, then choose the newest ticket by `createdDate` among those relevant matches.
 - **Created date rule**: For DevOps ticket JSON, `createdDate` is the ticket creation timestamp. Comment dates are not used to decide the latest ticket.
+- **Automatic source preference when `Source=All`**: Logic and methodology prompts such as Greek or PNL calculation questions prefer reference documents first, while ticket-history prompts such as root causes, common issues, latest tickets, report issue summaries, and explicit ticket-number requests prefer ticket JSON first.
+
+### RAG Regression Testing
+
+The repository includes an offline RAG non-regression suite for retrieval and ranking behavior:
+
+```powershell
+node --env-file-if-exists=.env scripts/rag-eval.js
+```
+
+Equivalent npm command:
+
+```powershell
+npm run test:rag
+```
+
+What it covers:
+
+- docs-vs-tickets source routing
+- exact ticket-number retrieval
+- latest related ticket selection
+- broad ticket-summary ranking
+- representative report topics such as DSR, monthend, CTP, billing, and deal-corruption prompts
+
+Important scope notes:
+
+- `scripts/rag-eval.js` and `scripts/rag-eval-cases.js` are offline evaluation tools only. They are not used by the live chat runtime.
+- The case set is representative, not exhaustive. It is a regression gate, not a proof that every possible prompt is correct.
+
+When to run it:
+
+- after every major modification to RAG-related logic
+- especially after changes to source routing, query-mode classification, exact ticket lookup, latest-ticket selection, reranking, ticket-topic scoring, prompt context construction, ingestion/chunking, or retrieval candidate logic
+
+Recommended verification flow after major RAG changes:
+
+1. Run `npm test`
+2. Run `npm run test:rag`
+3. Review and explain any failures before handoff
+
+If a change intentionally alters expected retrieval behavior, update both the relevant eval case and this README so the documented behavior stays aligned with the code.
 
 ### Multiple Vector Instances
 
