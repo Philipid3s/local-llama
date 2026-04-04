@@ -28,6 +28,15 @@ function includesAny(value, patterns = []) {
 }
 
 function assertCase(testCase, result) {
+  if (testCase.expectedNoMatches) {
+    ensure(!result.ok, "expected retrieval to return no matches");
+    ensure(result.reason === "no_matches", `expected reason=no_matches, got ${result.reason}`);
+    ensure(result.sourceFilter === testCase.expectedSource, `expected sourceFilter=${testCase.expectedSource}, got ${result.sourceFilter}`);
+    ensure(result.queryMode === testCase.expectedMode, `expected queryMode=${testCase.expectedMode}, got ${result.queryMode}`);
+    ensure((result.rows || []).length === 0, "expected zero rows");
+    return;
+  }
+
   ensure(result.ok, `expected retrieval to succeed, got ${result.reason}`);
   ensure(result.sourceFilter === testCase.expectedSource, `expected sourceFilter=${testCase.expectedSource}, got ${result.sourceFilter}`);
   ensure(result.queryMode === testCase.expectedMode, `expected queryMode=${testCase.expectedMode}, got ${result.queryMode}`);

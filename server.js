@@ -300,10 +300,11 @@ function isTicketAnalysisQuery(query) {
   const normalized = String(query || "").trim().toLowerCase();
   if (!normalized) return false;
   if (extractExplicitTicketNumber(normalized)) return true;
+  const docIntent = isDocLogicQuery(normalized) || isDocReferenceQuery(normalized);
   if (/\broot cause\b|\broot causes\b|\bcommon issues\b|\bmost common issues\b/.test(normalized)) return true;
   if (/\blatest\b|\bmost recent\b|\bnewest\b|\bsummar(?:y|ize|ise)\b/.test(normalized)) return true;
   if (/\bwhat tickets?\b|\bwhich tickets?\b|\btickets? say about\b/.test(normalized)) return true;
-  if (/\bbilling statement\b|\bdeal corruption\b|\bctp\b|\bctpr\b|\bdsr\b|\bmonthend\b|\bmonth end\b/.test(normalized)) return true;
+  if (!docIntent && /\bbilling statement\b|\bdeal corruption\b|\bctp\b|\bctpr\b|\bdsr\b|\bmonthend\b|\bmonth end\b/.test(normalized)) return true;
   if (/\bwhat do you know about\b/.test(normalized) && /\breport\b|\bbilling statement\b|\bdeal corruption\b|\bctp\b|\bdsr\b/.test(normalized)) {
     return true;
   }
@@ -1083,6 +1084,25 @@ function detectReportFamilies(text) {
   return families;
 }
 
+function buildRagGetWhere(sourceFilter, extraWhere = null) {
+  const normalizedSourceFilter = normalizeSourceFilter(sourceFilter);
+  const clauses = [];
+
+  if (normalizedSourceFilter === "ticket_json") {
+    clauses.push({ sourceKind: "ticket_json" });
+  } else if (normalizedSourceFilter === "reference_doc") {
+    clauses.push({ sourceKind: "reference_doc" });
+  }
+
+  if (extraWhere && typeof extraWhere === "object" && Object.keys(extraWhere).length > 0) {
+    clauses.push(extraWhere);
+  }
+
+  if (clauses.length === 0) return undefined;
+  if (clauses.length === 1) return clauses[0];
+  return { $and: clauses };
+}
+
 const PRIMARY_REPORT_FAMILIES = new Set(["monthend", "ctp", "dsr", "billing_statement", "fx_risk"]);
 
 function extractTicketDescriptionText(document) {
@@ -1126,10 +1146,12 @@ function scoreLatestTicketTopicMatch(query, row) {
       score: 0,
       directScore: 0,
       mixedFamilyPenalty: 0,
+      matchedDirectTerms: 0,
       titleMatches: 0,
       descriptionMatches: 0,
       phraseMatches: 0,
       referenceListMatches: 0,
+      topicTermCount: 0,
       exactTitleMatch: false,
       exactDescriptionMatch: false
     };
@@ -1147,6 +1169,7 @@ function scoreLatestTicketTopicMatch(query, row) {
   const exactReferenceListMatch = topicQuery.length >= 4 && referencedTicketList.includes(topicQuery);
   const titleMatches = topicTerms.filter((term) => title.includes(term)).length;
   const descriptionMatches = topicTerms.filter((term) => mainDescription.includes(term)).length;
+  const matchedDirectTerms = topicTerms.filter((term) => title.includes(term) || mainDescription.includes(term)).length;
   const referenceListMatches = topicTerms.filter((term) => referencedTicketList.includes(term)).length;
   const phraseMatches = topicPhrases.filter((phrase) => title.includes(phrase) || mainDescription.includes(phrase)).length;
   const referenceListPhraseMatches = topicPhrases.filter((phrase) => referencedTicketList.includes(phrase)).length;
@@ -1175,13 +1198,29 @@ function scoreLatestTicketTopicMatch(query, row) {
       referenceListPhraseMatches,
     directScore,
     mixedFamilyPenalty,
+    matchedDirectTerms,
     titleMatches,
     descriptionMatches,
     phraseMatches,
     referenceListMatches,
+    topicTermCount: topicTerms.length,
     exactTitleMatch,
     exactDescriptionMatch
   };
+}
+
+function hasStrongTopicEvidence(topicScore) {
+  if (!topicScore) return false;
+  if (topicScore.exactTitleMatch || topicScore.exactDescriptionMatch) return true;
+  if ((topicScore.phraseMatches || 0) > 0) return true;
+
+  const matchedDirectTerms = topicScore.matchedDirectTerms || 0;
+  const topicTermCount = topicScore.topicTermCount || 0;
+  if (topicTermCount <= 1) {
+    return matchedDirectTerms >= 1;
+  }
+
+  return matchedDirectTerms >= Math.min(2, topicTermCount);
 }
 
 function hasSummaryLanguage(query) {
@@ -1374,10 +1413,16 @@ async function findLexicalRagMatches(collection, query, sourceFilter = "all") {
     return [];
   }
 
-  const result = await collection.get({
+  const getOptions = {
     limit: collectionCount,
     include: ["documents", "metadatas"]
-  });
+  };
+  const where = buildRagGetWhere(sourceFilter);
+  if (where) {
+    getOptions.where = where;
+  }
+
+  const result = await collection.get(getOptions);
 
   const rows = filterRowsBySource(result.rows(), sourceFilter);
   const matches = [];
@@ -1455,10 +1500,12 @@ async function findLatestTicketTopicRows(collection, query, sourceFilter = "all"
     return [];
   }
 
-  const result = await collection.get({
+  const getOptions = {
     limit: collectionCount,
-    include: ["documents", "metadatas"]
-  });
+    include: ["documents", "metadatas"],
+    where: buildRagGetWhere(sourceFilter, { documentKind: "devops-ticket" })
+  };
+  const result = await collection.get(getOptions);
 
   const ticketRows = filterRowsBySource(result.rows(), sourceFilter)
     .filter((row) => row.metadata?.ticketNumber && row.metadata?.documentKind === "devops-ticket");
@@ -1478,6 +1525,7 @@ async function findLatestTicketTopicRows(collection, query, sourceFilter = "all"
         createdTimestamp: row.metadata?.createdDate ? Date.parse(row.metadata.createdDate) : Number.NaN,
         bestTopicScore: Number.NEGATIVE_INFINITY,
         bestDirectTopicScore: Number.NEGATIVE_INFINITY,
+        hasStrongTopicEvidence: false,
         bestRow: row,
         bestRowChunkIndex: Number(row.metadata?.chunkIndex) || 1
       });
@@ -1486,6 +1534,7 @@ async function findLatestTicketTopicRows(collection, query, sourceFilter = "all"
     const group = groups.get(ticketNumber);
     const chunkIndex = Number(row.metadata?.chunkIndex) || 1;
     group.rows.push(row);
+    group.hasStrongTopicEvidence = group.hasStrongTopicEvidence || hasStrongTopicEvidence(topic);
     if (Number.isFinite(row.metadata?.createdDate ? Date.parse(row.metadata.createdDate) : Number.NaN)) {
       group.createdTimestamp = row.metadata?.createdDate ? Date.parse(row.metadata.createdDate) : group.createdTimestamp;
     }
@@ -1504,11 +1553,14 @@ async function findLatestTicketTopicRows(collection, query, sourceFilter = "all"
   const rankedGroups = [...groups.values()];
   const bestDirectTopicScore = Math.max(...rankedGroups.map((group) => group.bestDirectTopicScore || 0));
   const bestTopicScore = Math.max(...rankedGroups.map((group) => group.bestTopicScore || 0));
+  if (bestDirectTopicScore <= 0 && bestTopicScore <= 0) {
+    return [];
+  }
   const directTopicFloor = bestDirectTopicScore > 0 ? Math.max(3, bestDirectTopicScore * 0.45) : 0;
   const topicFloor = bestTopicScore > 0 ? Math.max(3, bestTopicScore * 0.45) : 0;
 
-  const directGroups = rankedGroups.filter((group) => (group.bestDirectTopicScore || 0) >= directTopicFloor);
-  const topicalGroups = rankedGroups.filter((group) => (group.bestTopicScore || 0) >= topicFloor);
+  const directGroups = rankedGroups.filter((group) => group.hasStrongTopicEvidence && (group.bestDirectTopicScore || 0) >= directTopicFloor);
+  const topicalGroups = rankedGroups.filter((group) => group.hasStrongTopicEvidence && (group.bestTopicScore || 0) >= topicFloor);
   const candidateGroups = directGroups.length ? directGroups : topicalGroups;
 
   if (!candidateGroups.length) {
@@ -1753,13 +1805,16 @@ function resolveTicketRows(query, scoredRows) {
 
   if (latestFocused) {
     const bestDirectTopicScore = Math.max(...rankedGroups.map((group) => group.directTopicScore || 0));
+    const bestTopicScore = Math.max(...rankedGroups.map((group) => group.topicScore || 0));
+    if (bestDirectTopicScore <= 0 && bestTopicScore <= 0) {
+      return [];
+    }
     const directTopicFloor = bestDirectTopicScore > 0 ? Math.max(3, bestDirectTopicScore * 0.45) : 0;
     const directTopicalGroups = rankedGroups.filter((group) =>
       bestDirectTopicScore > 0 &&
       (group.directTopicScore || 0) >= directTopicFloor &&
       (group.topicTitleMatches > 0 || group.topicDescriptionMatches > 0 || group.topicPhraseMatches > 0)
     );
-    const bestTopicScore = Math.max(...rankedGroups.map((group) => group.topicScore || 0));
     const topicFloor = bestTopicScore > 0 ? Math.max(3, bestTopicScore * 0.45) : 0;
     const topicalGroups = rankedGroups.filter((group) =>
       bestTopicScore > 0 &&
@@ -2116,6 +2171,15 @@ async function retrieveRagRowsForQuery(query, vectorInstanceId, sourceFilter = "
         rows
       };
     }
+    return {
+      ok: false,
+      reason: "no_matches",
+      instance,
+      queryMode,
+      sourceFilter: normalizedSourceFilter,
+      explicitTicketNumber,
+      rows: []
+    };
   }
 
   const queryEmbeddings = await embedTexts([query]);

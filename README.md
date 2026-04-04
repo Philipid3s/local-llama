@@ -196,6 +196,7 @@ Typical usage:
 - **Exact ticket lookup**: Prompts that contain an explicit ticket number such as `summarize ticket 5000` bypass embedding search and use a direct metadata lookup on `ticketNumber` first. This is both faster and more reliable than broad vector retrieval for exact-ID requests.
 - **Exact ticket answer constraints**: When an explicit ticket number is found, the system prompt tells the model that the requested ticket was resolved exactly and that it must answer from that ticket's retrieved excerpts only.
 - **Latest related ticket lookup**: Prompts such as `what is the latest ticket related to monthend report?` first prefer title and ticket-description relevance to the topic, then choose the newest ticket by `createdDate` among those relevant matches.
+- **No-topic safeguard for latest queries**: If a latest-ticket query does not have enough topical evidence for any DevOps ticket, the retrieval layer returns no match instead of substituting the newest unrelated ticket in the knowledge base.
 - **Created date rule**: For DevOps ticket JSON, `createdDate` is the ticket creation timestamp. Comment dates are not used to decide the latest ticket.
 - **Automatic source preference when `Source=All`**: Logic and methodology prompts such as Greek or PNL calculation questions prefer reference documents first, while ticket-history prompts such as root causes, common issues, latest tickets, report issue summaries, and explicit ticket-number requests prefer ticket JSON first.
 

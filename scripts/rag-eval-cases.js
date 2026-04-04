@@ -50,6 +50,20 @@ const DOC_TOPICS = {
       /linked component/i
     ]
   },
+  report_logic_routing: {
+    family: "docs_logic",
+    topic: "report_logic_routing",
+    description: "Report logic questions should stay on docs when the user asks for calculation or methodology rather than ticket history.",
+    prompts: [
+      "what is the calculation logic for the CTP report?"
+    ],
+    expectedSource: "reference_doc",
+    expectedMode: "precise",
+    allowedDocPatterns: [
+      /entrade pnl methodology\.docx/i,
+      /creating a custom deal formula\.docx/i
+    ]
+  },
   environment_setup: {
     family: "docs_configuration",
     topic: "environment_setup",
@@ -128,6 +142,17 @@ const TICKET_TOPICS = {
     expectedMode: "precise",
     allowedTopTickets: ["5113", "5052", "4950", "4888"],
     preferredTopTicket: "5113"
+  },
+  unknown_latest_topic: {
+    family: "ticket_reports",
+    topic: "unknown_latest_topic",
+    description: "Latest-ticket queries with no topical evidence should fail cleanly instead of returning an unrelated newest ticket.",
+    prompts: [
+      "what is the latest ticket related to unknown zebra flux report?"
+    ],
+    expectedSource: "ticket_json",
+    expectedMode: "precise",
+    expectedNoMatches: true
   },
   monthend_report: {
     family: "ticket_reports",
