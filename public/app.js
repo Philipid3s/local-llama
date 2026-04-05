@@ -1348,8 +1348,12 @@ async function sendChatMessage(userText) {
   try {
     const res = await fetch("/api/chat/stream", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "X-Session-Id": thread.id
+      },
       body: JSON.stringify({
+        sessionId: thread.id,
         model,
         messages: buildChatMessages(thread),
         webSearchEnabled: webSearchEnabled,

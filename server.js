@@ -1,3 +1,4 @@
+const { AsyncLocalStorage } = require("node:async_hooks");
 const http = require("node:http");
 const { randomUUID } = require("node:crypto");
 const fs = require("node:fs");
@@ -14,7 +15,8 @@ const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || "http://localhost:11434";
 const PUBLIC_DIR = path.join(__dirname, "public");
 const NODE_MODULES_DIR = path.join(__dirname, "node_modules");
 const LOG_DIR = path.join(__dirname, "logs");
-const LOG_FILE = path.join(LOG_DIR, "server.log");
+const LOG_DAILY_DIR = path.join(LOG_DIR, "daily");
+const LOG_SESSION_DIR = path.join(LOG_DIR, "sessions");
 const MAX_JSON_BYTES = 1_000_000;
 const MAX_DOCUMENT_JSON_BYTES = 15_000_000;
 const MAX_DOCUMENT_BYTES = 10_000_000;
@@ -37,6 +39,7 @@ const DEVOPS_TICKET_MAX_RECORD_CHARS = readIntEnv("DEVOPS_TICKET_MAX_RECORD_CHAR
 const DEFAULT_VECTOR_INSTANCE_ID = process.env.DEFAULT_VECTOR_INSTANCE_ID || "default";
 const vectorClients = new Map();
 const vectorCollectionPromises = new Map();
+const requestLogContext = new AsyncLocalStorage();
 
 function readBoolEnv(name, defaultValue) {
   const raw = process.env[name];
@@ -98,9 +101,33 @@ const SUPPORTED_DOCUMENT_TYPES = {
 const SOURCE_FILTERS = new Set(["all", "reference_doc", "ticket_json"]);
 
 function setupFileLogging() {
-  fs.mkdirSync(LOG_DIR, { recursive: true });
+  fs.mkdirSync(LOG_DAILY_DIR, { recursive: true });
+  fs.mkdirSync(LOG_SESSION_DIR, { recursive: true });
+
+  const getLogDate = (value = new Date()) => value.toISOString().slice(0, 10);
+  const sanitizeLogSegment = (value, fallback = "unknown") => {
+    const sanitized = String(value || "")
+      .trim()
+      .replace(/[^a-zA-Z0-9._-]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 80);
+    return sanitized || fallback;
+  };
+  const getDailyLogFile = (date = new Date()) => path.join(LOG_DAILY_DIR, `${getLogDate(date)}.log`);
+  const getSessionLogFile = (sessionId, date = new Date()) =>
+    path.join(LOG_SESSION_DIR, sanitizeLogSegment(sessionId, "session"), `${getLogDate(date)}.log`);
+  const renderContextPrefix = (context) => {
+    if (!context) return "";
+    const parts = [];
+    if (context.requestId) parts.push(`req:${context.requestId}`);
+    if (context.sessionId) parts.push(`session:${context.sessionId}`);
+    if (context.method && context.path) parts.push(`${context.method} ${context.path}`);
+    return parts.length ? `[${parts.join("] [")}] ` : "";
+  };
 
   const appendLogLine = (level, values) => {
+    const context = requestLogContext.getStore() || null;
+    const now = new Date();
     const rendered = values
       .map((value) => {
         if (value instanceof Error) {
@@ -116,8 +143,13 @@ function setupFileLogging() {
         }
       })
       .join(" ");
-
-    fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] [${level}] ${rendered}\n`);
+    const line = `[${now.toISOString()}] [${level}] ${renderContextPrefix(context)}${rendered}\n`;
+    fs.appendFileSync(getDailyLogFile(now), line);
+    if (context?.sessionId) {
+      const sessionLogFile = getSessionLogFile(context.sessionId, now);
+      fs.mkdirSync(path.dirname(sessionLogFile), { recursive: true });
+      fs.appendFileSync(sessionLogFile, line);
+    }
   };
 
   for (const level of ["log", "info", "warn", "error"]) {
@@ -135,6 +167,33 @@ function setupFileLogging() {
   process.on("unhandledRejection", (reason) => {
     console.error("Unhandled rejection:", reason);
   });
+}
+
+function createRequestLoggingContext(req, parsedUrl) {
+  const forwardedFor = String(req.headers["x-forwarded-for"] || "")
+    .split(",")[0]
+    .trim();
+  const remoteAddress = forwardedFor || req.socket?.remoteAddress || "";
+  const headerSessionId = String(req.headers["x-session-id"] || "").trim();
+  return {
+    requestId: randomUUID(),
+    sessionId: headerSessionId || null,
+    method: req.method || "",
+    path: parsedUrl.pathname,
+    remoteAddress
+  };
+}
+
+function updateRequestLoggingContext(patch) {
+  const context = requestLogContext.getStore();
+  if (!context || !patch || typeof patch !== "object") return;
+  Object.assign(context, patch);
+}
+
+function extractSessionId(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  return raw.slice(0, 120);
 }
 
 function sendJson(res, statusCode, payload) {
@@ -2700,11 +2759,23 @@ async function handleChatStream(req, res) {
   try {
     const body = await readJsonBody(req);
     const { model, messages, webSearchEnabled, webSearchQuery, vectorSearchEnabled, vectorInstanceId, sourceFilter } = body;
+    const sessionId = extractSessionId(body.sessionId || body.threadId);
+    updateRequestLoggingContext({ sessionId });
 
     if (!model || !Array.isArray(messages) || messages.length === 0) {
       sendJson(res, 400, { error: "model and messages[] are required." });
       return;
     }
+
+    console.log("Chat stream request", {
+      model,
+      sessionId,
+      messageCount: messages.length,
+      webSearchEnabled: Boolean(webSearchEnabled),
+      vectorSearchEnabled: Boolean(vectorSearchEnabled),
+      vectorInstanceId: vectorInstanceId || null,
+      sourceFilter: sourceFilter || "all"
+    });
 
     let finalMessages = prependConversationGuard(messages);
     finalMessages = await maybeAugmentMessagesWithDocumentContext(
@@ -2876,11 +2947,23 @@ async function handleChat(req, res) {
   try {
     const body = await readJsonBody(req);
     const { model, messages, webSearchEnabled, webSearchQuery, vectorSearchEnabled, vectorInstanceId, sourceFilter } = body;
+    const sessionId = extractSessionId(body.sessionId || body.threadId);
+    updateRequestLoggingContext({ sessionId });
 
     if (!model || !Array.isArray(messages) || messages.length === 0) {
       sendJson(res, 400, { error: "model and messages[] are required." });
       return;
     }
+
+    console.log("Chat request", {
+      model,
+      sessionId,
+      messageCount: messages.length,
+      webSearchEnabled: Boolean(webSearchEnabled),
+      vectorSearchEnabled: Boolean(vectorSearchEnabled),
+      vectorInstanceId: vectorInstanceId || null,
+      sourceFilter: sourceFilter || "all"
+    });
 
     let finalMessages = prependConversationGuard(messages);
     finalMessages = await maybeAugmentMessagesWithDocumentContext(
@@ -2989,59 +3072,81 @@ function serveStatic(req, res, parsedUrl) {
 function createServer() {
   return http.createServer(async (req, res) => {
     const parsedUrl = new URL(req.url, `http://${req.headers.host}`);
+    const context = createRequestLoggingContext(req, parsedUrl);
+    requestLogContext.run(context, async () => {
+      const startedAt = Date.now();
+      let finished = false;
+      const logCompletion = (eventName) => {
+        if (finished) return;
+        finished = true;
+        console.log("Request completed", {
+          event: eventName,
+          statusCode: res.statusCode,
+          durationMs: Date.now() - startedAt,
+          remoteAddress: context.remoteAddress || null
+        });
+      };
 
-    if (req.method === "GET" && parsedUrl.pathname === "/api/models") {
-      await handleModels(req, res);
-      return;
-    }
+      res.on("finish", () => logCompletion("finish"));
+      res.on("close", () => logCompletion("close"));
 
-    if (req.method === "GET" && parsedUrl.pathname === "/api/vector/instances") {
-      await handleVectorInstances(req, res);
-      return;
-    }
+      console.log("Request started", {
+        remoteAddress: context.remoteAddress || null
+      });
 
-    if (req.method === "GET" && parsedUrl.pathname === "/api/vector/library") {
-      await handleVectorLibrary(req, res, parsedUrl);
-      return;
-    }
+      if (req.method === "GET" && parsedUrl.pathname === "/api/models") {
+        await handleModels(req, res);
+        return;
+      }
 
-    if (req.method === "GET" && parsedUrl.pathname === "/api/vector/test") {
-      await handleVectorTest(req, res, parsedUrl);
-      return;
-    }
+      if (req.method === "GET" && parsedUrl.pathname === "/api/vector/instances") {
+        await handleVectorInstances(req, res);
+        return;
+      }
 
-    if (req.method === "POST" && parsedUrl.pathname === "/api/chat") {
-      await handleChat(req, res);
-      return;
-    }
+      if (req.method === "GET" && parsedUrl.pathname === "/api/vector/library") {
+        await handleVectorLibrary(req, res, parsedUrl);
+        return;
+      }
 
-    if (req.method === "POST" && parsedUrl.pathname === "/api/chat/stream") {
-      await handleChatStream(req, res);
-      return;
-    }
+      if (req.method === "GET" && parsedUrl.pathname === "/api/vector/test") {
+        await handleVectorTest(req, res, parsedUrl);
+        return;
+      }
 
-    if (req.method === "POST" && (parsedUrl.pathname === "/api/document/extract" || parsedUrl.pathname === "/api/pdf/extract")) {
-      await handleDocumentExtract(req, res);
-      return;
-    }
+      if (req.method === "POST" && parsedUrl.pathname === "/api/chat") {
+        await handleChat(req, res);
+        return;
+      }
 
-    if (req.method === "POST" && parsedUrl.pathname === "/api/rag/ingest") {
-      await handleRagIngest(req, res);
-      return;
-    }
+      if (req.method === "POST" && parsedUrl.pathname === "/api/chat/stream") {
+        await handleChatStream(req, res);
+        return;
+      }
 
-    if (req.method === "POST" && parsedUrl.pathname === "/api/vector/delete") {
-      await handleVectorDelete(req, res);
-      return;
-    }
+      if (req.method === "POST" && (parsedUrl.pathname === "/api/document/extract" || parsedUrl.pathname === "/api/pdf/extract")) {
+        await handleDocumentExtract(req, res);
+        return;
+      }
 
-    if (req.method === "GET") {
-      serveStatic(req, res, parsedUrl);
-      return;
-    }
+      if (req.method === "POST" && parsedUrl.pathname === "/api/rag/ingest") {
+        await handleRagIngest(req, res);
+        return;
+      }
 
-    res.writeHead(405);
-    res.end("Method Not Allowed");
+      if (req.method === "POST" && parsedUrl.pathname === "/api/vector/delete") {
+        await handleVectorDelete(req, res);
+        return;
+      }
+
+      if (req.method === "GET") {
+        serveStatic(req, res, parsedUrl);
+        return;
+      }
+
+      res.writeHead(405);
+      res.end("Method Not Allowed");
+    });
   });
 }
 
